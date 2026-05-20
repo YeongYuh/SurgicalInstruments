@@ -79,10 +79,12 @@ onnx_path = os.environ.get("ONNX_MODEL_PATH", "models/best.onnx")
 print(f"  Detector   : backend={backend}")
 if backend == "onnx":
     onnx_ok = os.path.exists(onnx_path)
-    print(f"  ONNX model : {onnx_path}  ({'OK' if onnx_ok else 'MISSING — export with: python3 -c \"from ultralytics import YOLO; YOLO(chr(39)models/best.pt{chr(39)}).export(format=chr(39)onnx{chr(39)}, opset=12)\"'})")
+    onnx_status = "OK" if onnx_ok else "MISSING — run: python3 -c \"from ultralytics import YOLO; YOLO('models/best.pt').export(format='onnx', opset=12)\""
+    print(f"  ONNX model : {onnx_path}  ({onnx_status})")
     try:
         import onnxruntime as ort
-        print(f"  onnxruntime: {ort.__version__}  providers={ort.get_available_providers()}")
+        providers_str = ", ".join(ort.get_available_providers())
+        print(f"  onnxruntime: {ort.__version__}  providers=[{providers_str}]")
     except ImportError:
         print("  onnxruntime: NOT installed  -> pip install 'onnxruntime>=1.16,<1.20'")
 
