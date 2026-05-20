@@ -27,6 +27,10 @@ export SCALE_READER_MODE="${SCALE_READER_MODE:-serial}"
 export SERIAL_PORT="${SERIAL_PORT:-/dev/ttyUSB0}"
 export SERIAL_BAUDRATE="${SERIAL_BAUDRATE:-9600}"
 
+# ── Detector backend (pt=PyTorch CPU, onnx=ONNX Runtime ~3x faster on CPU) ─
+export DETECTOR_BACKEND="${DETECTOR_BACKEND:-pt}"
+export ONNX_MODEL_PATH="${ONNX_MODEL_PATH:-models/best.onnx}"
+
 # ── Startup diagnostics ──────────────────────────────────────────────────
 python3 - <<'PYEOF'
 import sys, platform, os
@@ -70,6 +74,18 @@ if not os.path.exists(model):
 cam = os.environ.get("WEBCAM_INDEX", "0")
 print(f"  Camera     : /dev/video{cam}  (index={cam})")
 
+backend = os.environ.get("DETECTOR_BACKEND", "pt")
+onnx_path = os.environ.get("ONNX_MODEL_PATH", "models/best.onnx")
+print(f"  Detector   : backend={backend}")
+if backend == "onnx":
+    onnx_ok = os.path.exists(onnx_path)
+    print(f"  ONNX model : {onnx_path}  ({'OK' if onnx_ok else 'MISSING — export with: python3 -c \"from ultralytics import YOLO; YOLO(chr(39)models/best.pt{chr(39)}).export(format=chr(39)onnx{chr(39)}, opset=12)\"'})")
+    try:
+        import onnxruntime as ort
+        print(f"  onnxruntime: {ort.__version__}  providers={ort.get_available_providers()}")
+    except ImportError:
+        print("  onnxruntime: NOT installed  -> pip install 'onnxruntime>=1.16,<1.20'")
+
 mode = os.environ.get("SCALE_READER_MODE", "serial")
 port = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")
 baud = os.environ.get("SERIAL_BAUDRATE", "9600")
@@ -99,7 +115,8 @@ LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 PORT="${BACKEND_PORT:-5000}"
 
 echo ""
-echo "Scale : ${SCALE_READER_MODE}  port=${SERIAL_PORT}  baud=${SERIAL_BAUDRATE}"
+echo "Scale    : ${SCALE_READER_MODE}  port=${SERIAL_PORT}  baud=${SERIAL_BAUDRATE}"
+echo "Detector : ${DETECTOR_BACKEND}  onnx=${ONNX_MODEL_PATH}"
 echo ""
 echo "Web UI:"
 echo "  Local  : http://localhost:${PORT}"

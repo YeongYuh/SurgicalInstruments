@@ -12,7 +12,12 @@ from app.detector import SurgicalInstrumentDetector
 from app.scale_reader import create_scale_reader
 
 # ── Shared singletons ────────────────────────────────────────────────────────
-detector = SurgicalInstrumentDetector(config.MODEL_PATH)
+detector = SurgicalInstrumentDetector(
+    model_path=config.MODEL_PATH,
+    backend=config.DETECTOR_BACKEND,
+    onnx_path=config.ONNX_MODEL_PATH,
+    onnx_task=config.ONNX_TASK,
+)
 
 scale_reader = create_scale_reader(
     mode=config.SCALE_READER_MODE,

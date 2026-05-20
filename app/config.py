@@ -8,6 +8,14 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
 # Detection
 CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.25"))
 
+# Detector backend — "pt" (default) or "onnx"
+# ONNX is ~3x faster on CPU (onnxruntime CPUExecutionProvider).
+# Set STRICT_DETECTOR_BACKEND=true to crash instead of falling back to .pt.
+DETECTOR_BACKEND        = os.environ.get("DETECTOR_BACKEND", "pt")
+ONNX_MODEL_PATH         = os.environ.get("ONNX_MODEL_PATH", "models/best.onnx")
+ONNX_TASK               = os.environ.get("ONNX_TASK", "segment")
+STRICT_DETECTOR_BACKEND = os.environ.get("STRICT_DETECTOR_BACKEND", "false").lower() == "true"
+
 # Weight verification
 EXPECTED_WEIGHT  = float(os.environ.get("EXPECTED_WEIGHT", "1520.35"))
 WEIGHT_TOLERANCE = float(os.environ.get("WEIGHT_TOLERANCE", "0.5"))
