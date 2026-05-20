@@ -1,0 +1,14 @@
+# YOLO11 object detection
+# Pinned to verified working version on Jetson Nano (JetPack 4.6, PyTorch 2.4.1 CPU)
+ultralytics==8.4.52
+
+# opencv-python is intentionally excluded on Jetson Nano.
+# The system already has OpenCV 4.1.1 via libopencv-python.
+# Create the venv with --system-site-packages to inherit it:
+#   python3.8 -m venv venv --system-site-packages
+# opencv-python
+
+numpy
+Pillow
+pyserial
+flask>=2.3

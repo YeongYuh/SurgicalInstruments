@@ -1,0 +1,35 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Environment (keep .env.example, ignore actual .env)
+.env
+
+# ML models — large binaries, place manually
+models/*.pt
+models/*.engine
+models/*.onnx
+models/*.tflite
+
+# Input images — place manually
+input/
+
+# Generated output
+output/uploads/
+output/annotated/
+output/frames/
+output/history.json
+
+# Logs
+*.log
+
+# Claude internal
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db

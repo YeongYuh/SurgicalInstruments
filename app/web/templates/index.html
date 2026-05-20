@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=1024">
+  <title>手術器械智能盤點系統</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div id="root">
+
+    <!-- ── Header ─────────────────────────────────────────────────────── -->
+    <header id="header">
+      <div id="logo">
+        <div id="logo-icon">囧</div>
+        <span>手術器械智能盤點系統</span>
+      </div>
+    </header>
+
+    <!-- ── Main ───────────────────────────────────────────────────────── -->
+    <main id="main">
+
+      <!-- Left panel -->
+      <section id="left-panel">
+        <div class="panel-title">影像分析區</div>
+
+        <div id="image-area"
+             ondragover="onDragOver(event)"
+             ondragleave="onDragLeave(event)"
+             ondrop="onDrop(event)">
+
+          <div id="placeholder" class="visible">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none"
+                 stroke="#9ca3af" stroke-width="1.5">
+              <rect x="3" y="3" width="18" height="18" rx="2"/>
+              <circle cx="8.5" cy="8.5" r="1.5"/>
+              <polyline points="21 15 16 10 5 21"/>
+              <line x1="12" y1="8" x2="12" y2="16"/>
+              <line x1="8" y1="12" x2="16" y2="12"/>
+            </svg>
+            <p>拖放圖片至此或點擊上傳</p>
+          </div>
+
+          <img id="preview-img" alt="preview" style="display:none">
+          <img id="camera-stream" alt="camera" style="display:none">
+          <input type="file" id="file-input" accept="image/*" style="display:none"
+                 onchange="onFileChange(event)">
+        </div>
+
+        <div id="btn-row">
+          <button class="btn-outline" onclick="document.getElementById('file-input').click()">
+            &#8679; 上傳圖片
+          </button>
+          <button class="btn-outline" id="btn-camera" onclick="toggleCamera()">
+            &#9676; 開啟攝影機
+          </button>
+          <button class="btn-primary" id="btn-recognize" onclick="startRecognize()">
+            &#9740; 開始辨識
+          </button>
+        </div>
+      </section>
+
+      <!-- Right panel -->
+      <section id="right-panel">
+
+        <!-- 1. Recognition results -->
+        <div id="results-section">
+          <div class="section-header">
+            <span class="section-title">辨識結果</span>
+            <div class="header-actions">
+              <button class="btn-ghost" onclick="openHistory()">&#9200; 歷史記錄</button>
+              <button class="btn-accent" onclick="downloadReport()">&#9112; 產生報告</button>
+            </div>
+          </div>
+
+          <div id="table-wrap">
+            <table id="results-table">
+              <colgroup>
+                <col class="col-name">
+                <col class="col-qty">
+                <col class="col-std">
+                <col class="col-state">
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>器械類別</th>
+                  <th>數量</th>
+                  <th>標準</th>
+                  <th>狀態</th>
+                </tr>
+              </thead>
+              <tbody id="results-tbody">
+                <tr><td colspan="4" class="empty-row">尚無辨識結果</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div id="update-row">
+            <span id="update-time">更新時間：—</span>
+            <button class="btn-ghost small" onclick="manualRefresh()">&#8635; 手動刷新</button>
+          </div>
+        </div>
+
+        <!-- 2. Inventory statistics -->
+        <div id="stats-section">
+          <div class="section-title">盤點統計</div>
+          <div id="stats-body">
+            <div id="chart-wrap">
+              <canvas id="donut-chart" width="110" height="110"></canvas>
+              <div id="chart-legend">
+                <span class="legend-dot normal"></span>正常
+                <span class="legend-dot missing"></span>缺少
+                <span class="legend-dot extra"></span>多出
+              </div>
+            </div>
+            <div id="stat-boxes">
+              <!-- Row 1: item counts -->
+              <div class="stat-box normal-box">
+                <div class="stat-label">正常項目</div>
+                <div class="stat-num" id="cnt-normal">0</div>
+              </div>
+              <div class="stat-box missing-box">
+                <div class="stat-label">缺少項目</div>
+                <div class="stat-num" id="cnt-missing">0</div>
+              </div>
+              <div class="stat-box extra-box">
+                <div class="stat-label">多出項目</div>
+                <div class="stat-num" id="cnt-extra">0</div>
+              </div>
+              <!-- Row 2: weight summary -->
+              <div class="stat-box weight-neutral-box">
+                <div class="stat-label">標準重量</div>
+                <div class="stat-num stat-wt-num" id="stat-exp-wt">—</div>
+              </div>
+              <div class="stat-box weight-neutral-box">
+                <div class="stat-label">實際重量</div>
+                <div class="stat-num stat-wt-num" id="stat-act-wt">—</div>
+              </div>
+              <div class="stat-box weight-ok-box" id="stat-wt-ok-box">
+                <div class="stat-label">重量符合</div>
+                <div class="stat-num" id="stat-wt-ok">—</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+
+      </section>
+    </main>
+  </div>
+
+  <!-- ── History modal ─────────────────────────────────────────────────── -->
+  <div id="history-modal" style="display:none">
+    <div id="history-box">
+      <div id="history-header">
+        <span>歷史記錄</span>
+        <button class="btn-ghost" onclick="closeHistory()">✕</button>
+      </div>
+      <div id="history-content">
+        <table id="history-table">
+          <thead>
+            <tr><th>時間</th><th>來源</th><th>器械</th><th>重量(g)</th></tr>
+          </thead>
+          <tbody id="history-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
