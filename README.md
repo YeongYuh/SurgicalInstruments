@@ -315,7 +315,36 @@ diagnostic block before starting Flask.  Override any value inline:
 SERIAL_PORT=/dev/ttyACM0 ./run_jetson.sh          # Arduino on ACM0
 SCALE_READER_MODE=mock ./run_jetson.sh             # no hardware connected
 WEBCAM_INDEX=1 BACKEND_PORT=8080 ./run_jetson.sh   # custom camera / port
+DETECTOR_BACKEND=pt ./run_jetson.sh                # force PyTorch backend
 ```
+
+### Detector backend — ONNX vs PyTorch
+
+The default backend is **ONNX** (`CPUExecutionProvider`), benchmarked at ~3.9× faster
+than PyTorch on the Jetson Nano CPU:
+
+| Backend | `detector.predict()` | Notes |
+|---------|----------------------|-------|
+| `onnx` (default) | ~1.6 s/frame | ONNX Runtime, `CPUExecutionProvider` |
+| `pt` | ~6.3 s/frame | PyTorch / Ultralytics |
+
+`best.onnx` must be generated once before use (already present if setup was followed):
+
+```bash
+source venv/bin/activate
+python3 -c "from ultralytics import YOLO; YOLO('models/best.pt').export(format='onnx', opset=12)"
+```
+
+If `models/best.onnx` is missing at startup, the app falls back to `models/best.pt`
+automatically with a log warning.  Set `STRICT_DETECTOR_BACKEND=true` to disable fallback.
+
+To force PyTorch:
+
+```bash
+DETECTOR_BACKEND=pt ./run_jetson.sh
+```
+
+TensorRT (`.engine`) remains a future optimization path for additional speedup.
 
 ### Verified Jetson Nano scale configuration
 

@@ -27,8 +27,8 @@ export SCALE_READER_MODE="${SCALE_READER_MODE:-serial}"
 export SERIAL_PORT="${SERIAL_PORT:-/dev/ttyUSB0}"
 export SERIAL_BAUDRATE="${SERIAL_BAUDRATE:-9600}"
 
-# ── Detector backend (pt=PyTorch CPU, onnx=ONNX Runtime ~3x faster on CPU) ─
-export DETECTOR_BACKEND="${DETECTOR_BACKEND:-pt}"
+# ── Detector backend (onnx=ONNX Runtime ~4x faster on CPU, pt=PyTorch fallback) ─
+export DETECTOR_BACKEND="${DETECTOR_BACKEND:-onnx}"
 export ONNX_MODEL_PATH="${ONNX_MODEL_PATH:-models/best.onnx}"
 
 # ── Startup diagnostics ──────────────────────────────────────────────────
