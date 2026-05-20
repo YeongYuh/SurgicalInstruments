@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Optional, Union
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_DEBUG_TIMING = os.environ.get("DEBUG_INFERENCE_TIMING", "false").lower() == "true"
 
 
 class SurgicalInstrumentDetector:
@@ -55,8 +58,13 @@ class SurgicalInstrumentDetector:
         conf: float = 0.25,
     ) -> tuple[Any, list[dict]]:
         """Accept a file path (str/Path) or a BGR numpy frame."""
+        t_start = time.perf_counter()
         self._load_model()
+
+        t_infer = time.perf_counter()
         results = self._model(source, conf=conf, verbose=False)
+        t_after_infer = time.perf_counter()
+
         result = results[0]
 
         detections = []
@@ -74,6 +82,17 @@ class SurgicalInstrumentDetector:
                     "confidence": confidence,
                     "xyxy": xyxy,
                 })
+
+        t_end = time.perf_counter()
+
+        if _DEBUG_TIMING:
+            total_ms    = (t_end - t_start) * 1000
+            infer_ms    = (t_after_infer - t_infer) * 1000
+            extract_ms  = (t_end - t_after_infer) * 1000
+            logger.info(
+                "[Timing/%s] total=%.0f ms  model_call=%.0f ms  extract=%.0f ms  dets=%d",
+                self._effective_backend, total_ms, infer_ms, extract_ms, len(detections),
+            )
 
         return result, detections
 

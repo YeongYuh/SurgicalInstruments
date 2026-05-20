@@ -38,6 +38,25 @@ if config.SCALE_READER_MODE == "serial":
 
     threading.Thread(target=_warmup_scale, name="scale-warmup", daemon=True).start()
 
+# Load the detector model (PT or ONNX) in the background at startup so the
+# first user upload is not stalled by a cold-load delay (~1-10 s).
+import logging as _logging
+import numpy as _np
+_det_logger = _logging.getLogger(__name__)
+
+def _warmup_detector() -> None:
+    import time as _time
+    t0 = _time.perf_counter()
+    dummy = _np.zeros((64, 64, 3), dtype=_np.uint8)
+    try:
+        detector.predict(dummy, conf=0.25)
+        ms = (_time.perf_counter() - t0) * 1000
+        _det_logger.info("[Detector] Warmup done — backend=%s  %.0f ms", detector._effective_backend, ms)
+    except Exception as exc:
+        _det_logger.warning("[Detector] Warmup failed: %s", exc)
+
+threading.Thread(target=_warmup_detector, name="detector-warmup", daemon=True).start()
+
 # Per-class expected counts — loaded from disk, editable at runtime
 _STANDARDS_FILE = Path(config.OUTPUT_DIR) / "standards.json"
 standards: dict[str, int] = {}
