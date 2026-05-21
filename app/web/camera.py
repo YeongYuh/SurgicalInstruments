@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import base64
 import copy
+import glob
 import threading
 import time
 from datetime import datetime
+from typing import Union
 
 import cv2
 
@@ -13,10 +15,34 @@ from app.visualizer import draw_detections
 from app.web import compute_weight_verification, history as hist
 
 
+def _available_video_devices() -> list[str]:
+    return sorted(glob.glob("/dev/video*"))
+
+
+def _open_capture(source: Union[int, str]) -> cv2.VideoCapture:
+    """Try to open the camera; if integer-index fails, retry with /dev/videoN path."""
+    cap = cv2.VideoCapture(source)
+    if cap.isOpened():
+        return cap
+
+    # Integer-index failed — try explicit device path (works on some Jetson builds)
+    if isinstance(source, int):
+        path = f"/dev/video{source}"
+        cap2 = cv2.VideoCapture(path)
+        if cap2.isOpened():
+            print(f"[CameraThread] Integer index {source} failed; opened via path {path}")
+            return cap2
+        cap2.release()
+
+    return cap  # caller checks isOpened()
+
+
 class CameraThread(threading.Thread):
-    def __init__(self, webcam_index: int = config.WEBCAM_INDEX):
+    def __init__(self, camera_source: Union[int, str] = config.CAMERA_SOURCE):
         super().__init__(daemon=True)
-        self.webcam_index = webcam_index
+        self.camera_source = camera_source
+        # Keep legacy attribute for any external code that reads it
+        self.webcam_index = camera_source if isinstance(camera_source, int) else 0
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
@@ -57,14 +83,21 @@ class CameraThread(threading.Thread):
         # Import here to avoid circular import at module load time
         from app.web import detector, scale_reader, standards, unit_weights, state_lock
 
-        cap = cv2.VideoCapture(self.webcam_index)
+        cap = _open_capture(self.camera_source)
         if not cap.isOpened():
-            print(f"[CameraThread] Cannot open webcam index {self.webcam_index}")
+            available = _available_video_devices()
+            print(
+                f"[CameraThread] Cannot open camera source={self.camera_source!r}\n"
+                f"  Available video devices: {available or ['none found']}\n"
+                f"  Try: CAMERA_SOURCE=/dev/video0 ./run_jetson.sh\n"
+                f"       CAMERA_SOURCE=/dev/video1 ./run_jetson.sh\n"
+                f"       CAMERA_SOURCE=1 ./run_jetson.sh"
+            )
             return
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.WEBCAM_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.WEBCAM_HEIGHT)
-        print(f"[CameraThread] Started (index={self.webcam_index})")
+        print(f"[CameraThread] Started (source={self.camera_source!r})")
 
         last_inference = 0.0
 

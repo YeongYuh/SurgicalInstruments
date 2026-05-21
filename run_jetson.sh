@@ -31,6 +31,10 @@ export SERIAL_BAUDRATE="${SERIAL_BAUDRATE:-9600}"
 export DETECTOR_BACKEND="${DETECTOR_BACKEND:-onnx}"
 export ONNX_MODEL_PATH="${ONNX_MODEL_PATH:-models/best.onnx}"
 
+# ── Camera source (integer index or /dev/videoN path) ────────────────────────
+# Use CAMERA_SOURCE=/dev/video1 ./run_jetson.sh if /dev/video0 fails to open.
+export CAMERA_SOURCE="${CAMERA_SOURCE:-0}"
+
 # ── Startup diagnostics ──────────────────────────────────────────────────
 python3 - <<'PYEOF'
 import sys, platform, os
@@ -71,8 +75,22 @@ print(f"  Model      : {model}  ({'OK' if os.path.exists(model) else 'MISSING'})
 if not os.path.exists(model):
     print("               -> place trained best.pt at the path above")
 
-cam = os.environ.get("WEBCAM_INDEX", "0")
-print(f"  Camera     : /dev/video{cam}  (index={cam})")
+import glob
+cam_src = os.environ.get("CAMERA_SOURCE", os.environ.get("WEBCAM_INDEX", "0"))
+video_devs = sorted(glob.glob("/dev/video*"))
+devs_str = "  ".join(video_devs) if video_devs else "none found"
+print(f"  Camera src : {cam_src}")
+print(f"  Video devs : {devs_str}")
+if cam_src.startswith("/") and not os.path.exists(cam_src):
+    print(f"  [WARNING]  {cam_src} not found!")
+    print(f"               -> available: {devs_str}")
+    print(f"               -> try: CAMERA_SOURCE=/dev/video1 ./run_jetson.sh")
+elif not cam_src.startswith("/"):
+    expected = f"/dev/video{cam_src}"
+    if not os.path.exists(expected):
+        print(f"  [WARNING]  {expected} not found (index={cam_src})!")
+        print(f"               -> available: {devs_str}")
+        print(f"               -> try: CAMERA_SOURCE=/dev/video1 ./run_jetson.sh")
 
 backend = os.environ.get("DETECTOR_BACKEND", "pt")
 onnx_path = os.environ.get("ONNX_MODEL_PATH", "models/best.onnx")
@@ -119,6 +137,7 @@ PORT="${BACKEND_PORT:-5000}"
 echo ""
 echo "Scale    : ${SCALE_READER_MODE}  port=${SERIAL_PORT}  baud=${SERIAL_BAUDRATE}"
 echo "Detector : ${DETECTOR_BACKEND}  onnx=${ONNX_MODEL_PATH}"
+echo "Camera   : source=${CAMERA_SOURCE}"
 echo ""
 echo "Web UI:"
 echo "  Local  : http://localhost:${PORT}"

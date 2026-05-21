@@ -167,7 +167,7 @@ def camera_start():
     with web_pkg.state_lock:
         if web_pkg.camera_thread is not None and web_pkg.camera_thread.is_running():
             return jsonify(ok=True, status="already_running")
-        cam = CameraThread(webcam_index=config.WEBCAM_INDEX)
+        cam = CameraThread(camera_source=config.CAMERA_SOURCE)
         web_pkg.camera_thread = cam
     cam.start()
     return jsonify(ok=True, status="streaming")

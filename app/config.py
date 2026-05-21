@@ -36,10 +36,25 @@ SERIAL_READ_RETRIES = int(os.environ.get("SERIAL_READ_RETRIES", "5"))
 # Source type — "image" | "webcam"
 SOURCE_TYPE = os.environ.get("SOURCE_TYPE", "image")
 
-# Webcam settings
-# WEBCAM_INDEX=0 for /dev/video0 (USB webcam).
-# For Jetson CSI camera use a GStreamer string instead of an integer index.
-WEBCAM_INDEX              = int(os.environ.get("WEBCAM_INDEX", "0"))
+# Webcam / camera settings
+# CAMERA_SOURCE accepts:
+#   integer index  : "0", "1"          → cv2.VideoCapture(0)
+#   device path    : "/dev/video0"     → cv2.VideoCapture("/dev/video0")
+#   GStreamer str  : "nvarguscamerasrc ..." → cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+# Falls back to WEBCAM_INDEX for backward compatibility.
+def _parse_camera_source(raw: str):
+    """Return int for numeric index, str otherwise."""
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+_camera_source_raw = os.environ.get(
+    "CAMERA_SOURCE", os.environ.get("WEBCAM_INDEX", "0")
+)
+CAMERA_SOURCE = _parse_camera_source(_camera_source_raw)
+WEBCAM_INDEX  = CAMERA_SOURCE if isinstance(CAMERA_SOURCE, int) else 0  # backward compat
+
 WEBCAM_WIDTH              = int(os.environ.get("WEBCAM_WIDTH", "1280"))
 WEBCAM_HEIGHT             = int(os.environ.get("WEBCAM_HEIGHT", "720"))
 WEBCAM_DETECTION_INTERVAL = float(os.environ.get("WEBCAM_DETECTION_INTERVAL", "1.0"))
