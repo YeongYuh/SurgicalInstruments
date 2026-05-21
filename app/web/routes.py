@@ -169,7 +169,7 @@ def camera_frame():
     if cam is None or not cam.is_running():
         return Response(status=503)
     frame = cam.get_mjpeg_frame()
-    if not frame:
+    if not frame or len(frame) < 500:   # guard against empty / malformed buffer
         return Response(status=204)
     return Response(
         frame,

@@ -36,8 +36,12 @@ export ONNX_MODEL_PATH="${ONNX_MODEL_PATH:-models/best.onnx}"
 # Use CAMERA_SOURCE=/dev/video1 ./run_jetson.sh if /dev/video0 is wrong device.
 export CAMERA_SOURCE="${CAMERA_SOURCE:-/dev/video0}"
 
-# ── Detection interval (seconds between YOLO inferences) ─────────────────────
-# Preview updates independently at ~10 FPS regardless of this setting.
+# ── Camera capture parameters ─────────────────────────────────────────────────
+# 640×480 @ 15 fps with MJPG fourcc: optimal for USB webcam on Jetson Nano CPU.
+# YOLO inference runs in a background thread every WEBCAM_DETECTION_INTERVAL s.
+export WEBCAM_WIDTH="${WEBCAM_WIDTH:-640}"
+export WEBCAM_HEIGHT="${WEBCAM_HEIGHT:-480}"
+export WEBCAM_FPS="${WEBCAM_FPS:-15}"
 export WEBCAM_DETECTION_INTERVAL="${WEBCAM_DETECTION_INTERVAL:-5}"
 
 # ── Startup diagnostics ──────────────────────────────────────────────────

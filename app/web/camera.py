@@ -131,26 +131,58 @@ class CameraThread(threading.Thread):
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.WEBCAM_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.WEBCAM_HEIGHT)
-        # Limit V4L2 internal buffer queue to 1 frame — reduces pending QBUF
-        # operations at release time and avoids "Bad file descriptor" ioctl errors
-        # on the Jetson 4.9 kernel when cap.release() is called.
+        # MJPG fourcc: USB cameras send MJPEG natively — avoids expensive YUYV
+        # decode + re-encode and roughly doubles throughput on Jetson.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FPS, config.WEBCAM_FPS)
+        # One internal V4L2 buffer keeps the queued-frame count minimal at release.
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        print(f"[CameraThread] Started (source={self.camera_source!r})")
+
+        actual_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        cc_int     = int(cap.get(cv2.CAP_PROP_FOURCC))
+        cc_str     = "".join(chr((cc_int >> i) & 0xFF) for i in (0, 8, 16, 24))
+        print(
+            f"[CameraThread] Started (source={self.camera_source!r})  "
+            f"{actual_w}x{actual_h} @ {actual_fps:.0f} fps  fourcc={cc_str!r}"
+        )
+
+        # Discard initial frames — USB cameras often send black frames on startup.
+        warmup = 0
+        while warmup < 30 and not self._stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.05)
+                continue
+            warmup += 1
+            if frame is not None and float(frame.mean()) > 5.0:
+                break
+        if warmup:
+            print(f"[CameraThread] Warmup: {warmup} frame(s) discarded")
 
         last_inference = 0.0
+        read_ok = 0
+        read_fail = 0
 
         try:
             while not self._stop_event.is_set():
                 ret, frame = cap.read()
                 if not ret:
+                    read_fail += 1
+                    if read_fail % 30 == 1:
+                        print(f"[CameraThread] cap.read() failures: {read_fail} "
+                              f"(ok={read_ok})")
                     time.sleep(0.05)
                     continue
+                read_ok += 1
 
-                # Always update MJPEG buffer for smooth live preview
+                # Encode preview JPEG — only overwrite buffer when encode succeeds
+                # so a transient bad frame never replaces a good one with black data.
                 ok, buf = cv2.imencode(
                     ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70]
                 )
-                if ok:
+                if ok and buf.nbytes > 500:
                     with self._lock:
                         self._mjpeg_buffer = buf.tobytes()
 
@@ -171,12 +203,9 @@ class CameraThread(threading.Thread):
                     )
                     t.start()
         finally:
-            # Drain any frame the V4L2 driver queued after the loop exited so
-            # cap.release() does not encounter an unqueued buffer (QBUF bad-fd).
-            try:
-                cap.grab()
-            except Exception:
-                pass
+            # Do NOT call cap.grab() here — on the Jetson 4.9 kernel it triggers
+            # VIDIOC_QBUF on a half-closed device.  Let cap.release() clean up
+            # the single buffered frame itself.
             cap.release()
             print("[CameraThread] Stopped.")
 

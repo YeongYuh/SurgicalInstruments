@@ -9,10 +9,10 @@ let pendingFile  = null;
 let stdDebounce  = null;
 let uwDebounce   = null;
 let donutChart   = null;
-let pollTimer           = null;
-let weightPollTimer     = null;
-let cameraPreviewTimer  = null;
-let lastShownDetectionTs = null;
+let pollTimer            = null;
+let weightPollTimer      = null;
+let _previewController   = null;   // AbortController for the async preview loop
+let _previewBlobUrl      = null;   // last blob URL set on #camera-stream
 
 // ── Init ──────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', async () => {
@@ -226,20 +226,64 @@ function showCameraStream() {
   document.getElementById('placeholder').classList.remove('visible');
 }
 
-function startCameraPreview() {
-  stopCameraPreview();
+// ── Live preview — AbortController-driven fetch loop ─────────────────────
+// One request at a time: only fetch the next frame after the current one
+// completes. This prevents request pileup on a slow Jetson server and
+// ensures the browser always displays a valid JPEG, never a canceled load.
+
+function _previewDelay(ms, signal) {
+  return new Promise(resolve => {
+    const t = setTimeout(resolve, ms);
+    signal.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true });
+  });
+}
+
+async function _previewLoop(signal) {
   const stream = document.getElementById('camera-stream');
-  cameraPreviewTimer = setInterval(() => {
-    stream.src = '/camera/frame?t=' + Date.now();
-  }, 100);
+  while (!signal.aborted) {
+    try {
+      const res = await fetch('/camera/frame?t=' + Date.now(),
+                              { cache: 'no-store', signal });
+      if (signal.aborted) break;
+      const ct = res.headers.get('content-type') || '';
+      if (res.ok && ct.startsWith('image/jpeg')) {
+        const blob = await res.blob();
+        if (signal.aborted) break;
+        const newUrl = URL.createObjectURL(blob);
+        stream.src = newUrl;
+        if (_previewBlobUrl) URL.revokeObjectURL(_previewBlobUrl);
+        _previewBlobUrl = newUrl;
+        // ~15 FPS target; subtract negligible decode time
+        await _previewDelay(66, signal);
+      } else {
+        // 204 = camera starting (no frame yet), 503 = camera stopped
+        // Do NOT clear the image — keep displaying the last good frame.
+        await _previewDelay(200, signal);
+      }
+    } catch (e) {
+      if (signal.aborted) break;
+      await _previewDelay(500, signal);
+    }
+  }
+}
+
+function startCameraPreview() {
+  if (_previewController) return;          // already running
+  _previewController = new AbortController();
+  _previewLoop(_previewController.signal);
 }
 
 function stopCameraPreview() {
-  if (cameraPreviewTimer) {
-    clearInterval(cameraPreviewTimer);
-    cameraPreviewTimer = null;
+  if (_previewController) {
+    _previewController.abort();
+    _previewController = null;
   }
-  document.getElementById('camera-stream').src = '';
+  if (_previewBlobUrl) {
+    URL.revokeObjectURL(_previewBlobUrl);
+    _previewBlobUrl = null;
+  }
+  const stream = document.getElementById('camera-stream');
+  if (stream) stream.src = '';
 }
 
 function setUpdateTime(ts) {
@@ -273,13 +317,10 @@ async function pollStatus() {
       renderWeightVerification(data.weight_verification);
     }
 
-    // Show annotated image only when a new detection timestamp arrives,
-    // then revert to live preview after 3 s.
-    if (cameraActive && data.annotated_b64 && data.timestamp
-        && data.timestamp !== lastShownDetectionTs) {
-      lastShownDetectionTs = data.timestamp;
+    // When camera is active, detection results update the table and weight only.
+    // Live preview via _previewLoop always owns the image area — no annotated swap.
+    if (!cameraActive && data.annotated_b64) {
       showAnnotatedImage(data.annotated_b64);
-      setTimeout(() => { if (cameraActive) showCameraStream(); }, 3000);
     }
   } catch (e) { /* server starting up */ }
 }
@@ -396,7 +437,6 @@ async function toggleCamera() {
       stopCameraPreview();                                   // no more /camera/frame before stop
       await fetch('/camera/stop', { method: 'POST' });      // waits for cap.release()
       cameraActive = false;
-      lastShownDetectionTs = null;
     } else {
       // /camera/start waits 0.6 s internally to detect open failures
       const res  = await fetch('/camera/start', { method: 'POST' });
