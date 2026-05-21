@@ -318,6 +318,35 @@ WEBCAM_INDEX=1 BACKEND_PORT=8080 ./run_jetson.sh   # custom camera / port
 DETECTOR_BACKEND=pt ./run_jetson.sh                # force PyTorch backend
 ```
 
+### Camera FOURCC — YUYV vs MJPG
+
+The default capture format is **YUYV**, verified stable on the Jetson Nano USB webcam:
+
+| Setting | FPS (measured) | Notes |
+|---------|---------------|-------|
+| `YUYV` (default) | ~7.5 fps | Raw planar YUV — no libjpeg decode, clean logs |
+| `MJPG` | ~7.5 fps | Native MJPEG from camera — may print harmless `Corrupt JPEG data` warnings |
+| `AUTO` | driver default | Let V4L2 negotiate; result varies by camera |
+
+Measured FPS is ~7.5 on this camera regardless of fourcc — USB bandwidth and the V4L2
+driver on the Jetson 4.9 kernel do not honour the `fps=15` hint at this resolution.
+This is acceptable: live preview updates at the camera's natural rate and YOLO inference
+runs in a background thread every 5 seconds independently.
+
+To test a specific fourcc before starting the app:
+
+```bash
+python3 tools/test_camera_preview.py                # uses CAMERA_FOURCC env var (default YUYV)
+CAMERA_FOURCC=MJPG python3 tools/test_camera_preview.py
+```
+
+Override at runtime:
+
+```bash
+CAMERA_FOURCC=MJPG ./run_jetson.sh   # if your camera works better with MJPG
+CAMERA_FOURCC=AUTO ./run_jetson.sh   # let the driver decide
+```
+
 ### Detector backend — ONNX vs PyTorch
 
 The default backend is **ONNX** (`CPUExecutionProvider`), benchmarked at ~3.9× faster

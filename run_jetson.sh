@@ -47,7 +47,7 @@ export CAMERA_SOURCE="${CAMERA_SOURCE:-/dev/video0}"
 export WEBCAM_WIDTH="${WEBCAM_WIDTH:-640}"
 export WEBCAM_HEIGHT="${WEBCAM_HEIGHT:-480}"
 export WEBCAM_FPS="${WEBCAM_FPS:-15}"
-export CAMERA_FOURCC="${CAMERA_FOURCC:-MJPG}"
+export CAMERA_FOURCC="${CAMERA_FOURCC:-YUYV}"
 export WEBCAM_DETECTION_INTERVAL="${WEBCAM_DETECTION_INTERVAL:-5}"
 
 # ── Startup diagnostics ──────────────────────────────────────────────────
