@@ -25,16 +25,19 @@ def _open_capture(source: Union[int, str]) -> cv2.VideoCapture:
     if cap.isOpened():
         return cap
 
-    # Integer-index failed — try explicit device path (works on some Jetson builds)
+    # Integer-index failed — MUST release before retrying; the failed cap can hold
+    # the V4L2 file descriptor and block the second open attempt.
+    cap.release()
+
     if isinstance(source, int):
         path = f"/dev/video{source}"
-        cap2 = cv2.VideoCapture(path)
-        if cap2.isOpened():
+        cap = cv2.VideoCapture(path)
+        if cap.isOpened():
             print(f"[CameraThread] Integer index {source} failed; opened via path {path}")
-            return cap2
-        cap2.release()
+            return cap
+        cap.release()
 
-    return cap  # caller checks isOpened()
+    return cv2.VideoCapture(source)  # return fresh failed cap so caller sees isOpened()=False
 
 
 class CameraThread(threading.Thread):
