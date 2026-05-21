@@ -9,8 +9,10 @@ let pendingFile  = null;
 let stdDebounce  = null;
 let uwDebounce   = null;
 let donutChart   = null;
-let pollTimer       = null;
-let weightPollTimer = null;
+let pollTimer           = null;
+let weightPollTimer     = null;
+let cameraPreviewTimer  = null;
+let lastShownDetectionTs = null;
 
 // ── Init ──────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', async () => {
@@ -218,6 +220,28 @@ function showAnnotatedImage(b64) {
   document.getElementById('placeholder').classList.remove('visible');
 }
 
+function showCameraStream() {
+  document.getElementById('camera-stream').style.display = 'block';
+  document.getElementById('preview-img').style.display = 'none';
+  document.getElementById('placeholder').classList.remove('visible');
+}
+
+function startCameraPreview() {
+  stopCameraPreview();
+  const stream = document.getElementById('camera-stream');
+  cameraPreviewTimer = setInterval(() => {
+    stream.src = '/camera/frame?t=' + Date.now();
+  }, 100);
+}
+
+function stopCameraPreview() {
+  if (cameraPreviewTimer) {
+    clearInterval(cameraPreviewTimer);
+    cameraPreviewTimer = null;
+  }
+  document.getElementById('camera-stream').src = '';
+}
+
 function setUpdateTime(ts) {
   document.getElementById('update-time').textContent = ts ? '更新時間：' + ts : '更新時間：—';
 }
@@ -249,8 +273,13 @@ async function pollStatus() {
       renderWeightVerification(data.weight_verification);
     }
 
-    if (cameraActive && data.annotated_b64) {
+    // Show annotated image only when a new detection timestamp arrives,
+    // then revert to live preview after 3 s.
+    if (cameraActive && data.annotated_b64 && data.timestamp
+        && data.timestamp !== lastShownDetectionTs) {
+      lastShownDetectionTs = data.timestamp;
       showAnnotatedImage(data.annotated_b64);
+      setTimeout(() => { if (cameraActive) showCameraStream(); }, 3000);
     }
   } catch (e) { /* server starting up */ }
 }
@@ -360,16 +389,28 @@ async function startRecognize() {
 
 // ── Camera toggle ─────────────────────────────────────────────────────────
 async function toggleCamera() {
-  if (cameraActive) {
-    await fetch('/camera/stop', { method: 'POST' });
-    cameraActive = false;
-  } else {
-    const res  = await fetch('/camera/start', { method: 'POST' });
-    const data = await res.json();
-    if (data.ok) { cameraActive = true; }
-    else { alert('無法開啟攝影機：' + (data.error || '')); return; }
+  const btn = document.getElementById('btn-camera');
+  btn.disabled = true;
+  try {
+    if (cameraActive) {
+      await fetch('/camera/stop', { method: 'POST' });
+      cameraActive = false;
+      lastShownDetectionTs = null;
+    } else {
+      // /camera/start waits 0.6 s internally to detect open failures
+      const res  = await fetch('/camera/start', { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        cameraActive = true;
+      } else {
+        alert('無法開啟攝影機：' + (data.error || '未知錯誤'));
+        return;
+      }
+    }
+    syncCameraUI();
+  } finally {
+    btn.disabled = false;
   }
-  syncCameraUI();
 }
 
 function syncCameraUI() {
@@ -381,14 +422,14 @@ function syncCameraUI() {
   if (cameraActive) {
     btn.textContent = '⏹ 關閉攝影機';
     btn.classList.add('active');
-    stream.src = '/video_feed';
     stream.style.display = 'block';
     preview.style.display = 'none';
     placeholder.classList.remove('visible');
+    startCameraPreview();
   } else {
     btn.textContent = '◉ 開啟攝影機';
     btn.classList.remove('active');
-    stream.src = '';
+    stopCameraPreview();
     stream.style.display = 'none';
     placeholder.classList.add('visible');
     preview.style.display = 'none';

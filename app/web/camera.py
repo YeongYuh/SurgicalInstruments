@@ -6,7 +6,7 @@ import glob
 import threading
 import time
 from datetime import datetime
-from typing import Union
+from typing import Optional, Union
 
 import cv2
 
@@ -54,6 +54,9 @@ class CameraThread(threading.Thread):
         self._counts: dict = {}
         self._weight: float | None = None
         self._timestamp: str = ""
+        self._last_detection_ts: str = ""
+        self._inference_running: bool = False
+        self._error: Optional[str] = None
 
     # ── public read API (called from Flask routes) ────────────────────────
 
@@ -74,6 +77,33 @@ class CameraThread(threading.Thread):
                 ),
             }
 
+    def get_status(self) -> dict:
+        with self._lock:
+            return {
+                "running": self.is_alive() and not self._stop_event.is_set(),
+                "source": str(self.camera_source),
+                "last_detection_ts": self._last_detection_ts,
+                "inference_running": self._inference_running,
+                "error": self._error,
+            }
+
+    def get_result(self) -> dict:
+        with self._lock:
+            return {
+                "timestamp": self._timestamp,
+                "counts": copy.deepcopy(self._counts),
+                "weight": self._weight,
+                "annotated_b64": (
+                    base64.b64encode(self._latest_annotated).decode()
+                    if self._latest_annotated
+                    else None
+                ),
+            }
+
+    def get_error(self) -> Optional[str]:
+        with self._lock:
+            return self._error
+
     def stop(self) -> None:
         self._stop_event.set()
 
@@ -89,13 +119,14 @@ class CameraThread(threading.Thread):
         cap = _open_capture(self.camera_source)
         if not cap.isOpened():
             available = _available_video_devices()
-            print(
-                f"[CameraThread] Cannot open camera source={self.camera_source!r}\n"
-                f"  Available video devices: {available or ['none found']}\n"
-                f"  Try: CAMERA_SOURCE=/dev/video0 ./run_jetson.sh\n"
-                f"       CAMERA_SOURCE=/dev/video1 ./run_jetson.sh\n"
-                f"       CAMERA_SOURCE=1 ./run_jetson.sh"
+            msg = (
+                f"Cannot open camera source={self.camera_source!r} — "
+                f"available: {available or ['none found']}. "
+                f"Try: CAMERA_SOURCE=/dev/video0 ./run_jetson.sh"
             )
+            print(f"[CameraThread] {msg}")
+            with self._lock:
+                self._error = msg
             return
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.WEBCAM_WIDTH)
@@ -111,7 +142,7 @@ class CameraThread(threading.Thread):
                     time.sleep(0.05)
                     continue
 
-                # Always update MJPEG buffer for smooth video
+                # Always update MJPEG buffer for smooth live preview
                 ok, buf = cv2.imencode(
                     ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70]
                 )
@@ -119,16 +150,37 @@ class CameraThread(threading.Thread):
                     with self._lock:
                         self._mjpeg_buffer = buf.tobytes()
 
-                # Inference on interval
+                # Spawn inference in background thread — never blocks preview
                 now = time.time()
-                if now - last_inference >= config.WEBCAM_DETECTION_INTERVAL:
+                with self._lock:
+                    inf_running = self._inference_running
+                if (now - last_inference >= config.WEBCAM_DETECTION_INTERVAL
+                        and not inf_running):
                     last_inference = now
-                    self._run_inference(frame, detector, scale_reader, standards, unit_weights, state_lock)
+                    with self._lock:
+                        self._inference_running = True
+                    t = threading.Thread(
+                        target=self._run_inference_bg,
+                        args=(frame.copy(), detector, scale_reader,
+                              standards, unit_weights, state_lock),
+                        daemon=True,
+                    )
+                    t.start()
         finally:
             cap.release()
             print("[CameraThread] Stopped.")
 
-    def _run_inference(self, frame, detector, scale_reader, standards, unit_weights, state_lock) -> None:
+    def _run_inference_bg(self, frame, detector, scale_reader,
+                          standards, unit_weights, state_lock) -> None:
+        try:
+            self._run_inference(frame, detector, scale_reader,
+                                standards, unit_weights, state_lock)
+        finally:
+            with self._lock:
+                self._inference_running = False
+
+    def _run_inference(self, frame, detector, scale_reader,
+                       standards, unit_weights, state_lock) -> None:
         try:
             _, detections = detector.predict(frame, conf=config.CONF_THRESHOLD)
             counts = detector.count_instruments(detections)
@@ -150,6 +202,7 @@ class CameraThread(threading.Thread):
                 self._counts = counts
                 self._weight = weight
                 self._timestamp = ts
+                self._last_detection_ts = ts
                 if ok:
                     self._latest_annotated = abuf.tobytes()
 

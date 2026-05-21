@@ -57,8 +57,9 @@ WEBCAM_INDEX  = CAMERA_SOURCE if isinstance(CAMERA_SOURCE, int) else 0  # backwa
 
 WEBCAM_WIDTH              = int(os.environ.get("WEBCAM_WIDTH", "1280"))
 WEBCAM_HEIGHT             = int(os.environ.get("WEBCAM_HEIGHT", "720"))
-WEBCAM_DETECTION_INTERVAL = float(os.environ.get("WEBCAM_DETECTION_INTERVAL", "1.0"))
+WEBCAM_DETECTION_INTERVAL = float(os.environ.get("WEBCAM_DETECTION_INTERVAL", "5.0"))
 WEBCAM_SAVE_FRAMES        = os.environ.get("WEBCAM_SAVE_FRAMES", "false").lower() == "true"
+CAMERA_PREVIEW_FPS        = int(os.environ.get("CAMERA_PREVIEW_FPS", "10"))
 
 # Web server
 BACKEND_HOST = os.environ.get("BACKEND_HOST", "0.0.0.0")

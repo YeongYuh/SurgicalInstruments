@@ -32,8 +32,13 @@ export DETECTOR_BACKEND="${DETECTOR_BACKEND:-onnx}"
 export ONNX_MODEL_PATH="${ONNX_MODEL_PATH:-models/best.onnx}"
 
 # ── Camera source (integer index or /dev/videoN path) ────────────────────────
-# Use CAMERA_SOURCE=/dev/video1 ./run_jetson.sh if /dev/video0 fails to open.
-export CAMERA_SOURCE="${CAMERA_SOURCE:-0}"
+# Default to path-based open — more reliable than integer index on Jetson OpenCV.
+# Use CAMERA_SOURCE=/dev/video1 ./run_jetson.sh if /dev/video0 is wrong device.
+export CAMERA_SOURCE="${CAMERA_SOURCE:-/dev/video0}"
+
+# ── Detection interval (seconds between YOLO inferences) ─────────────────────
+# Preview updates independently at ~10 FPS regardless of this setting.
+export WEBCAM_DETECTION_INTERVAL="${WEBCAM_DETECTION_INTERVAL:-5}"
 
 # ── Startup diagnostics ──────────────────────────────────────────────────
 python3 - <<'PYEOF'
@@ -77,10 +82,12 @@ if not os.path.exists(model):
 
 import glob
 cam_src = os.environ.get("CAMERA_SOURCE", os.environ.get("WEBCAM_INDEX", "0"))
+det_interval = os.environ.get("WEBCAM_DETECTION_INTERVAL", "5")
 video_devs = sorted(glob.glob("/dev/video*"))
 devs_str = "  ".join(video_devs) if video_devs else "none found"
 print(f"  Camera src : {cam_src}")
 print(f"  Video devs : {devs_str}")
+print(f"  Detect int : {det_interval} s  (preview ~10 FPS independent)")
 if cam_src.startswith("/") and not os.path.exists(cam_src):
     print(f"  [WARNING]  {cam_src} not found!")
     print(f"               -> available: {devs_str}")
@@ -137,7 +144,7 @@ PORT="${BACKEND_PORT:-5000}"
 echo ""
 echo "Scale    : ${SCALE_READER_MODE}  port=${SERIAL_PORT}  baud=${SERIAL_BAUDRATE}"
 echo "Detector : ${DETECTOR_BACKEND}  onnx=${ONNX_MODEL_PATH}"
-echo "Camera   : source=${CAMERA_SOURCE}"
+echo "Camera   : source=${CAMERA_SOURCE}  detect_interval=${WEBCAM_DETECTION_INTERVAL}s"
 echo ""
 echo "Web UI:"
 echo "  Local  : http://localhost:${PORT}"

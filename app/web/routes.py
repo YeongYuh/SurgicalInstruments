@@ -162,6 +162,49 @@ def video_feed():
     )
 
 
+@app.route("/camera/frame")
+def camera_frame():
+    with web_pkg.state_lock:
+        cam = web_pkg.camera_thread
+    if cam is None or not cam.is_running():
+        return Response(status=503)
+    frame = cam.get_mjpeg_frame()
+    if not frame:
+        return Response(status=204)
+    return Response(
+        frame,
+        mimetype="image/jpeg",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"},
+    )
+
+
+@app.route("/camera/status")
+def camera_status():
+    with web_pkg.state_lock:
+        cam = web_pkg.camera_thread
+    if cam is None:
+        return jsonify(running=False, source=None, last_detection_ts=None,
+                       inference_running=False, error=None)
+    return jsonify(**cam.get_status())
+
+
+@app.route("/camera/result")
+def camera_result():
+    with web_pkg.state_lock:
+        cam = web_pkg.camera_thread
+    if cam is None:
+        return jsonify(ok=False, error="Camera not started")
+    result = cam.get_result()
+    result["ok"] = True
+    with web_pkg.state_lock:
+        std = dict(web_pkg.standards)
+        uw = dict(web_pkg.unit_weights)
+    result["weight_verification"] = compute_weight_verification(
+        std, uw, result.get("weight"), config.WEIGHT_TOLERANCE
+    )
+    return jsonify(result)
+
+
 @app.route("/camera/start", methods=["POST"])
 def camera_start():
     with web_pkg.state_lock:
@@ -170,6 +213,13 @@ def camera_start():
         cam = CameraThread(camera_source=config.CAMERA_SOURCE)
         web_pkg.camera_thread = cam
     cam.start()
+    # Wait briefly so a camera-open failure is detectable before returning
+    time.sleep(0.6)
+    if not cam.is_running():
+        err = cam.get_error() or "Camera failed to open"
+        with web_pkg.state_lock:
+            web_pkg.camera_thread = None
+        return jsonify(ok=False, error=err), 500
     return jsonify(ok=True, status="streaming")
 
 
