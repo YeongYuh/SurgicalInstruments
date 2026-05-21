@@ -227,9 +227,12 @@ def camera_start():
 def camera_stop():
     with web_pkg.state_lock:
         cam = web_pkg.camera_thread
-        web_pkg.camera_thread = None
+        web_pkg.camera_thread = None  # immediately makes /camera/frame return 503
     if cam is not None:
         cam.stop()
+        cam.join(timeout=2.0)         # wait for cap.release() to complete
+        if cam.is_alive():
+            logger.warning("[camera_stop] CameraThread did not stop within 2 s")
     return jsonify(ok=True, status="stopped")
 
 

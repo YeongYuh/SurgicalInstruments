@@ -393,7 +393,8 @@ async function toggleCamera() {
   btn.disabled = true;
   try {
     if (cameraActive) {
-      await fetch('/camera/stop', { method: 'POST' });
+      stopCameraPreview();                                   // no more /camera/frame before stop
+      await fetch('/camera/stop', { method: 'POST' });      // waits for cap.release()
       cameraActive = false;
       lastShownDetectionTs = null;
     } else {

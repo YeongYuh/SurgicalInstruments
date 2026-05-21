@@ -131,6 +131,10 @@ class CameraThread(threading.Thread):
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.WEBCAM_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.WEBCAM_HEIGHT)
+        # Limit V4L2 internal buffer queue to 1 frame — reduces pending QBUF
+        # operations at release time and avoids "Bad file descriptor" ioctl errors
+        # on the Jetson 4.9 kernel when cap.release() is called.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         print(f"[CameraThread] Started (source={self.camera_source!r})")
 
         last_inference = 0.0
@@ -167,6 +171,12 @@ class CameraThread(threading.Thread):
                     )
                     t.start()
         finally:
+            # Drain any frame the V4L2 driver queued after the loop exited so
+            # cap.release() does not encounter an unqueued buffer (QBUF bad-fd).
+            try:
+                cap.grab()
+            except Exception:
+                pass
             cap.release()
             print("[CameraThread] Stopped.")
 
