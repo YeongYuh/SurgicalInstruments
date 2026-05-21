@@ -370,6 +370,27 @@ These are the defaults in `run_jetson.sh` and `.env.example`.
 | Weight is always the same wrong value | Wrong baud rate | `SERIAL_BAUDRATE=115200 ./run_jetson.sh` (match your Arduino sketch) |
 | No `/dev/ttyUSB*` at all | Driver missing or cable fault | `dmesg \| grep usb` to diagnose |
 
+### 7-inch HDMI LCD / kiosk display
+
+The UI is responsive and targets 1024×600 and 800×480 screens.
+Launch Chromium in kiosk mode after starting the Flask server:
+
+```bash
+chromium-browser --kiosk --app=http://127.0.0.1:5000 --force-device-scale-factor=1
+```
+
+If the UI is still too large for the physical display, reduce the scale factor:
+
+```bash
+chromium-browser --kiosk --app=http://127.0.0.1:5000 --force-device-scale-factor=0.9
+chromium-browser --kiosk --app=http://127.0.0.1:5000 --force-device-scale-factor=0.85
+chromium-browser --kiosk --app=http://127.0.0.1:5000 --force-device-scale-factor=0.8
+```
+
+The CSS compact mode (`@media (max-width: 1100px), (max-height: 700px)`) activates
+automatically on smaller screens and reduces header, padding, font sizes, and button
+heights while keeping all sections visible.
+
 ### Other Jetson Nano notes
 
 - USB webcam is `/dev/video0` → `WEBCAM_INDEX=0` (default).
