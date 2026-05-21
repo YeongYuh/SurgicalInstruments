@@ -37,11 +37,17 @@ export ONNX_MODEL_PATH="${ONNX_MODEL_PATH:-models/best.onnx}"
 export CAMERA_SOURCE="${CAMERA_SOURCE:-/dev/video0}"
 
 # ── Camera capture parameters ─────────────────────────────────────────────────
-# 640×480 @ 15 fps with MJPG fourcc: optimal for USB webcam on Jetson Nano CPU.
 # YOLO inference runs in a background thread every WEBCAM_DETECTION_INTERVAL s.
+# CAMERA_FOURCC options:
+#   MJPG  — camera sends native JPEG frames (fast, some cameras log libjpeg warnings)
+#   YUYV  — raw YUV, no decode warnings but slightly more CPU to re-encode
+#   AUTO  — let the V4L2 driver negotiate
+# If you see "Corrupt JPEG data" warnings and unstable preview, switch to YUYV:
+#   CAMERA_FOURCC=YUYV ./run_jetson.sh
 export WEBCAM_WIDTH="${WEBCAM_WIDTH:-640}"
 export WEBCAM_HEIGHT="${WEBCAM_HEIGHT:-480}"
 export WEBCAM_FPS="${WEBCAM_FPS:-15}"
+export CAMERA_FOURCC="${CAMERA_FOURCC:-MJPG}"
 export WEBCAM_DETECTION_INTERVAL="${WEBCAM_DETECTION_INTERVAL:-5}"
 
 # ── Startup diagnostics ──────────────────────────────────────────────────
@@ -85,13 +91,20 @@ if not os.path.exists(model):
     print("               -> place trained best.pt at the path above")
 
 import glob
-cam_src = os.environ.get("CAMERA_SOURCE", os.environ.get("WEBCAM_INDEX", "0"))
+cam_src      = os.environ.get("CAMERA_SOURCE", os.environ.get("WEBCAM_INDEX", "0"))
+cam_w        = os.environ.get("WEBCAM_WIDTH", "640")
+cam_h        = os.environ.get("WEBCAM_HEIGHT", "480")
+cam_fps      = os.environ.get("WEBCAM_FPS", "15")
+cam_fourcc   = os.environ.get("CAMERA_FOURCC", "MJPG")
 det_interval = os.environ.get("WEBCAM_DETECTION_INTERVAL", "5")
-video_devs = sorted(glob.glob("/dev/video*"))
-devs_str = "  ".join(video_devs) if video_devs else "none found"
+video_devs   = sorted(glob.glob("/dev/video*"))
+devs_str     = "  ".join(video_devs) if video_devs else "none found"
 print(f"  Camera src : {cam_src}")
 print(f"  Video devs : {devs_str}")
-print(f"  Detect int : {det_interval} s  (preview ~10 FPS independent)")
+print(f"  Capture    : {cam_w}x{cam_h} @ {cam_fps} fps  fourcc={cam_fourcc}")
+print(f"  Detect int : {det_interval} s  (preview ~15 FPS independent)")
+if cam_fourcc == "MJPG":
+    print("               (if 'Corrupt JPEG data' warnings appear, try CAMERA_FOURCC=YUYV)")
 if cam_src.startswith("/") and not os.path.exists(cam_src):
     print(f"  [WARNING]  {cam_src} not found!")
     print(f"               -> available: {devs_str}")

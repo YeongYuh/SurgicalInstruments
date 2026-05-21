@@ -131,9 +131,10 @@ class CameraThread(threading.Thread):
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.WEBCAM_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.WEBCAM_HEIGHT)
-        # MJPG fourcc: USB cameras send MJPEG natively — avoids expensive YUYV
-        # decode + re-encode and roughly doubles throughput on Jetson.
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        _fourcc = config.CAMERA_FOURCC
+        if _fourcc in ("MJPG", "YUYV"):
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*_fourcc))
+        # AUTO: leave fourcc at whatever the driver negotiates
         cap.set(cv2.CAP_PROP_FPS, config.WEBCAM_FPS)
         # One internal V4L2 buffer keeps the queued-frame count minimal at release.
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)

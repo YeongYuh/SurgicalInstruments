@@ -58,6 +58,11 @@ WEBCAM_INDEX  = CAMERA_SOURCE if isinstance(CAMERA_SOURCE, int) else 0  # backwa
 WEBCAM_WIDTH              = int(os.environ.get("WEBCAM_WIDTH", "1280"))
 WEBCAM_HEIGHT             = int(os.environ.get("WEBCAM_HEIGHT", "720"))
 WEBCAM_FPS                = int(os.environ.get("WEBCAM_FPS", "15"))
+# CAMERA_FOURCC: "MJPG" | "YUYV" | "AUTO"
+#   MJPG — camera sends native JPEG (fast, but some cameras produce libjpeg warnings)
+#   YUYV — raw planar YUV (no decode warnings, slightly more CPU for JPEG re-encode)
+#   AUTO — do not force fourcc, let the driver negotiate
+CAMERA_FOURCC             = os.environ.get("CAMERA_FOURCC", "MJPG").upper()
 WEBCAM_DETECTION_INTERVAL = float(os.environ.get("WEBCAM_DETECTION_INTERVAL", "5.0"))
 WEBCAM_SAVE_FRAMES        = os.environ.get("WEBCAM_SAVE_FRAMES", "false").lower() == "true"
 
