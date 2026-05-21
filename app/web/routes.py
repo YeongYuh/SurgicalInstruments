@@ -162,20 +162,26 @@ def video_feed():
     )
 
 
+_NO_CACHE = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma":        "no-cache",
+    "Expires":       "0",
+}
+
+
 @app.route("/camera/frame")
 def camera_frame():
     with web_pkg.state_lock:
         cam = web_pkg.camera_thread
+    # 204 for both "not running" and "running but no frame yet" — frontend
+    # keeps the last good image on 204 rather than going blank.
     if cam is None or not cam.is_running():
-        return Response(status=503)
-    frame = cam.get_mjpeg_frame()
-    if not frame or len(frame) < 500:   # guard against empty / malformed buffer
-        return Response(status=204)
-    return Response(
-        frame,
-        mimetype="image/jpeg",
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"},
-    )
+        return Response(status=204, headers=_NO_CACHE)
+    frame, seq = cam.get_mjpeg_frame_and_seq()
+    if not frame or len(frame) < 500:
+        return Response(status=204, headers=_NO_CACHE)
+    headers = {**_NO_CACHE, "X-Frame-Seq": str(seq)}
+    return Response(frame, mimetype="image/jpeg", headers=headers)
 
 
 @app.route("/camera/status")
@@ -209,30 +215,40 @@ def camera_result():
 def camera_start():
     with web_pkg.state_lock:
         if web_pkg.camera_thread is not None and web_pkg.camera_thread.is_running():
-            return jsonify(ok=True, status="already_running")
-        cam = CameraThread(camera_source=config.CAMERA_SOURCE)
+            return jsonify(ok=True, status="already_running",
+                           session_id=web_pkg.camera_session_id)
+        web_pkg.camera_session_id += 1
+        session_id = web_pkg.camera_session_id
+        # Clear any annotated frame from the previous session so a refresh after
+        # stop never re-displays the old camera image.
+        web_pkg.latest_state["annotated_b64"] = None
+        cam = CameraThread(camera_source=config.CAMERA_SOURCE, session_id=session_id)
         web_pkg.camera_thread = cam
     cam.start()
-    # Wait briefly so a camera-open failure is detectable before returning
+    # Wait briefly so a camera-open failure is detectable before returning.
     time.sleep(0.6)
     if not cam.is_running():
         err = cam.get_error() or "Camera failed to open"
         with web_pkg.state_lock:
             web_pkg.camera_thread = None
         return jsonify(ok=False, error=err), 500
-    return jsonify(ok=True, status="streaming")
+    return jsonify(ok=True, status="streaming", session_id=session_id)
 
 
 @app.route("/camera/stop", methods=["POST"])
 def camera_stop():
     with web_pkg.state_lock:
         cam = web_pkg.camera_thread
-        web_pkg.camera_thread = None  # immediately makes /camera/frame return 503
+        web_pkg.camera_thread = None  # immediately makes /camera/frame return 204
     if cam is not None:
         cam.stop()
-        cam.join(timeout=2.0)         # wait for cap.release() to complete
+        cam.join(timeout=2.0)
         if cam.is_alive():
             logger.warning("[camera_stop] CameraThread did not stop within 2 s")
+    # Clear camera-sourced annotated frame so a browser refresh after stop
+    # never re-displays the last camera image via /status → pollStatus().
+    with web_pkg.state_lock:
+        web_pkg.latest_state["annotated_b64"] = None
     return jsonify(ok=True, status="stopped")
 
 

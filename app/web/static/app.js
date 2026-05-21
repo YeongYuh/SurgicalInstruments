@@ -13,15 +13,31 @@ let pollTimer            = null;
 let weightPollTimer      = null;
 let _previewController   = null;   // AbortController for the async preview loop
 let _previewBlobUrl      = null;   // last blob URL set on #camera-stream
+let cameraSessionId      = 0;      // matches backend camera_session_id
+let _lastFrameSeq        = -1;     // last X-Frame-Seq seen; skip display if unchanged
 
 // ── Init ──────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', async () => {
   initChart();
   await fetchStandards();
   await fetchUnitWeights();
+  // Resolve camera state from the server BEFORE starting the poll loop so
+  // the first pollStatus() does not see a stale cameraActive=false and
+  // accidentally restore an old annotated image via syncCameraUI().
+  await initCameraState();
   startPolling();
   startWeightPolling();
 });
+
+async function initCameraState() {
+  try {
+    const res  = await fetch('/camera/status');
+    const data = await res.json();
+    cameraActive    = data.running === true;
+    cameraSessionId = data.session_id || 0;
+    syncCameraUI();   // starts preview loop if camera was already running
+  } catch (e) { /* server not ready yet — leave defaults */ }
+}
 
 // ── Chart.js donut ────────────────────────────────────────────────────────
 function initChart() {
@@ -242,22 +258,27 @@ async function _previewLoop(signal) {
   const stream = document.getElementById('camera-stream');
   while (!signal.aborted) {
     try {
-      const res = await fetch('/camera/frame?t=' + Date.now(),
-                              { cache: 'no-store', signal });
+      const url = '/camera/frame?session=' + cameraSessionId + '&t=' + Date.now();
+      const res = await fetch(url, { cache: 'no-store', signal });
       if (signal.aborted) break;
       const ct = res.headers.get('content-type') || '';
       if (res.ok && ct.startsWith('image/jpeg')) {
+        const seq = parseInt(res.headers.get('X-Frame-Seq') || '-1', 10);
         const blob = await res.blob();
         if (signal.aborted) break;
-        const newUrl = URL.createObjectURL(blob);
-        stream.src = newUrl;
-        if (_previewBlobUrl) URL.revokeObjectURL(_previewBlobUrl);
-        _previewBlobUrl = newUrl;
-        // ~15 FPS target; subtract negligible decode time
-        await _previewDelay(66, signal);
+        // Only update display when the backend has a genuinely new frame.
+        // This avoids redundant repaints when polling faster than ~7.5 FPS camera.
+        if (seq < 0 || seq !== _lastFrameSeq) {
+          const newUrl = URL.createObjectURL(blob);
+          stream.src = newUrl;
+          if (_previewBlobUrl) URL.revokeObjectURL(_previewBlobUrl);
+          _previewBlobUrl = newUrl;
+          _lastFrameSeq = seq;
+        }
+        // Camera produces ~7.5 FPS → 133 ms/frame; stay close to that rate.
+        await _previewDelay(130, signal);
       } else {
-        // 204 = camera starting (no frame yet), 503 = camera stopped
-        // Do NOT clear the image — keep displaying the last good frame.
+        // 204: camera starting or stopped — keep the last good frame displayed.
         await _previewDelay(200, signal);
       }
     } catch (e) {
@@ -274,6 +295,7 @@ function startCameraPreview() {
 }
 
 function stopCameraPreview() {
+  _lastFrameSeq = -1;
   if (_previewController) {
     _previewController.abort();
     _previewController = null;
@@ -317,11 +339,9 @@ async function pollStatus() {
       renderWeightVerification(data.weight_verification);
     }
 
-    // When camera is active, detection results update the table and weight only.
-    // Live preview via _previewLoop always owns the image area — no annotated swap.
-    if (!cameraActive && data.annotated_b64) {
-      showAnnotatedImage(data.annotated_b64);
-    }
+    // Annotated images are only shown by explicit user actions (upload / recognize).
+    // pollStatus() never touches the image area — avoids stale camera frames
+    // appearing on page refresh after the camera is stopped.
   } catch (e) { /* server starting up */ }
 }
 
@@ -442,7 +462,9 @@ async function toggleCamera() {
       const res  = await fetch('/camera/start', { method: 'POST' });
       const data = await res.json();
       if (data.ok) {
-        cameraActive = true;
+        cameraActive    = true;
+        cameraSessionId = data.session_id || 0;
+        _lastFrameSeq   = -1;
       } else {
         alert('無法開啟攝影機：' + (data.error || '未知錯誤'));
         return;

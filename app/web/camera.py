@@ -40,10 +40,15 @@ def _open_capture(source: Union[int, str]) -> cv2.VideoCapture:
     return cv2.VideoCapture(source)  # return fresh failed cap so caller sees isOpened()=False
 
 
+_debug = config.CAMERA_DEBUG
+
+
 class CameraThread(threading.Thread):
-    def __init__(self, camera_source: Union[int, str] = config.CAMERA_SOURCE):
+    def __init__(self, camera_source: Union[int, str] = config.CAMERA_SOURCE,
+                 session_id: int = 0):
         super().__init__(daemon=True)
         self.camera_source = camera_source
+        self.session_id = session_id
         # Keep legacy attribute for any external code that reads it
         self.webcam_index = camera_source if isinstance(camera_source, int) else 0
         self._stop_event = threading.Event()
@@ -56,6 +61,7 @@ class CameraThread(threading.Thread):
         self._timestamp: str = ""
         self._last_detection_ts: str = ""
         self._inference_running: bool = False
+        self._frame_seq: int = 0
         self._error: Optional[str] = None
 
     # ── public read API (called from Flask routes) ────────────────────────
@@ -63,6 +69,10 @@ class CameraThread(threading.Thread):
     def get_mjpeg_frame(self) -> bytes:
         with self._lock:
             return self._mjpeg_buffer
+
+    def get_mjpeg_frame_and_seq(self) -> tuple:
+        with self._lock:
+            return self._mjpeg_buffer, self._frame_seq
 
     def get_latest_state(self) -> dict:
         with self._lock:
@@ -82,6 +92,8 @@ class CameraThread(threading.Thread):
             return {
                 "running": self.is_alive() and not self._stop_event.is_set(),
                 "source": str(self.camera_source),
+                "session_id": self.session_id,
+                "frame_seq": self._frame_seq,
                 "last_detection_ts": self._last_detection_ts,
                 "inference_running": self._inference_running,
                 "error": self._error,
@@ -136,8 +148,9 @@ class CameraThread(threading.Thread):
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*_fourcc))
         # AUTO: leave fourcc at whatever the driver negotiates
         cap.set(cv2.CAP_PROP_FPS, config.WEBCAM_FPS)
-        # One internal V4L2 buffer keeps the queued-frame count minimal at release.
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Note: CAP_PROP_BUFFERSIZE intentionally NOT set — forcing it to 1 triggers
+        # VIDIOC_QBUF errors during cap.release() on the Jetson 4.9 kernel.
+        # The driver default buffer count handles teardown correctly.
 
         actual_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -145,9 +158,12 @@ class CameraThread(threading.Thread):
         cc_int     = int(cap.get(cv2.CAP_PROP_FOURCC))
         cc_str     = "".join(chr((cc_int >> i) & 0xFF) for i in (0, 8, 16, 24))
         print(
-            f"[CameraThread] Started (source={self.camera_source!r})  "
+            f"[CameraThread] session={self.session_id} started  "
+            f"source={self.camera_source!r}  "
             f"{actual_w}x{actual_h} @ {actual_fps:.0f} fps  fourcc={cc_str!r}"
         )
+        if _debug:
+            print(f"[CameraThread] DEBUG session={self.session_id} capture loop entering")
 
         # Discard initial frames — USB cameras often send black frames on startup.
         warmup = 0
@@ -186,6 +202,12 @@ class CameraThread(threading.Thread):
                 if ok and buf.nbytes > 500:
                     with self._lock:
                         self._mjpeg_buffer = buf.tobytes()
+                        self._frame_seq += 1
+                        _seq = self._frame_seq
+                    if _debug and _seq % 30 == 1:
+                        print(f"[CameraThread] DEBUG session={self.session_id} "
+                              f"seq={_seq} jpeg={buf.nbytes:,}B "
+                              f"mean={float(frame.mean()):.1f}")
 
                 # Spawn inference in background thread — never blocks preview
                 now = time.time()
@@ -196,6 +218,9 @@ class CameraThread(threading.Thread):
                     last_inference = now
                     with self._lock:
                         self._inference_running = True
+                    if _debug:
+                        print(f"[CameraThread] DEBUG session={self.session_id} "
+                              f"inference starting seq={self._frame_seq}")
                     t = threading.Thread(
                         target=self._run_inference_bg,
                         args=(frame.copy(), detector, scale_reader,
@@ -204,11 +229,15 @@ class CameraThread(threading.Thread):
                     )
                     t.start()
         finally:
-            # Do NOT call cap.grab() here — on the Jetson 4.9 kernel it triggers
-            # VIDIOC_QBUF on a half-closed device.  Let cap.release() clean up
-            # the single buffered frame itself.
+            # cap.release() may print "ioctl(VIDIOC_QBUF): Bad file descriptor"
+            # on the Jetson 4.9.337-tegra kernel — this is a harmless V4L2 driver
+            # noise during buffer teardown.  The camera restarts correctly on the
+            # next session.  Do NOT call cap.grab() before release — that makes
+            # the error worse by queuing into a half-closed device.
             cap.release()
-            print("[CameraThread] Stopped.")
+            if _debug:
+                print(f"[CameraThread] DEBUG session={self.session_id} released")
+            print(f"[CameraThread] session={self.session_id} stopped.")
 
     def _run_inference_bg(self, frame, detector, scale_reader,
                           standards, unit_weights, state_lock) -> None:

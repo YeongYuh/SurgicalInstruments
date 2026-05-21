@@ -79,6 +79,7 @@ state_lock = threading.Lock()
 
 # Camera thread — set by routes.py after start
 camera_thread = None  # type: ignore[assignment]
+camera_session_id: int = 0  # incremented on each successful start
 
 # Latest inference result shared between camera thread and /status route
 latest_state: dict = {

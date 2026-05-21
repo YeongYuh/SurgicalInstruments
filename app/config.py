@@ -63,6 +63,7 @@ WEBCAM_FPS                = int(os.environ.get("WEBCAM_FPS", "15"))
 #   YUYV — raw planar YUV (no decode warnings, slightly more CPU for JPEG re-encode)
 #   AUTO — do not force fourcc, let the driver negotiate
 CAMERA_FOURCC             = os.environ.get("CAMERA_FOURCC", "MJPG").upper()
+CAMERA_DEBUG              = os.environ.get("CAMERA_DEBUG", "false").lower() == "true"
 WEBCAM_DETECTION_INTERVAL = float(os.environ.get("WEBCAM_DETECTION_INTERVAL", "5.0"))
 WEBCAM_SAVE_FRAMES        = os.environ.get("WEBCAM_SAVE_FRAMES", "false").lower() == "true"
 
