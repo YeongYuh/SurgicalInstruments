@@ -1,6 +1,8 @@
 import logging
 import re
 import threading
+from collections import deque
+from statistics import median
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -9,6 +11,12 @@ logger = logging.getLogger(__name__)
 class BaseScaleReader:
     def read_weight(self) -> Optional[float]:
         raise NotImplementedError
+
+    def get_latest_weight(self) -> Optional[float]:
+        """Return the most recently cached weight without any I/O or blocking.
+        Returns None if no valid weight has been received yet.
+        Camera inference uses this to avoid blocking on serial retries."""
+        return None
 
     def close(self) -> None:
         pass
@@ -19,6 +27,9 @@ class MockScaleReader(BaseScaleReader):
         self.mock_weight = mock_weight
 
     def read_weight(self) -> Optional[float]:
+        return self.mock_weight
+
+    def get_latest_weight(self) -> Optional[float]:
         return self.mock_weight
 
 
@@ -59,14 +70,28 @@ class SerialScaleReader(BaseScaleReader):
         baudrate: int = 9600,
         timeout: float = 2.0,
         retries: int = 5,
+        zero_threshold: float = 2.0,
+        zero_confirm_samples: int = 3,
+        filter_window: int = 3,
+        transition_threshold: float = 5.0,
+        debug: bool = False,
     ):
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
         self.retries = retries
         self._ser = None
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()        # guards serial I/O (long-held)
+        self._cache_lock = threading.Lock()  # guards _latest only (never held during I/O)
         self._latest: Optional[float] = None
+
+        # Zero-rejection debounce + transition-aware median filter
+        self._zero_threshold       = zero_threshold
+        self._zero_confirm_samples = zero_confirm_samples
+        self._transition_threshold = transition_threshold
+        self._zero_candidate_count: int = 0          # consecutive near-zero readings seen
+        self._raw_window: deque = deque(maxlen=max(1, filter_window))  # for median
+        self._scale_debug          = debug
 
     # ── connection management ─────────────────────────────────────────
 
@@ -132,15 +157,127 @@ class SerialScaleReader(BaseScaleReader):
 
     # ── public API ────────────────────────────────────────────────────
 
+    def get_latest_weight(self) -> Optional[float]:
+        """Non-blocking: return the last valid weight received, or None.
+        Never touches the serial port.  Thread-safe."""
+        with self._cache_lock:
+            return self._latest
+
+    def _apply_sample(self, raw_value: float) -> None:
+        """Apply transition-aware zero-rejection debounce and median filter.
+
+        Called inside self._lock — must NOT acquire self._lock again.
+        May acquire self._cache_lock briefly to read/write _latest.
+
+        State machine (action per sample):
+
+          near-zero sample + current is non-zero
+            → zero_candidate: count consecutive near-zeros; don't touch window
+            → confirm_zero_reset (count >= threshold): flush window to [0]
+
+          near-zero sample + current is already near-zero / None
+            → accept_near_zero: append to window normally
+
+          non-zero sample + current is None
+            → init: clear window, start with this sample
+
+          non-zero sample + current is near-zero (zero → non-zero transition)
+            → zero_to_nonzero_reset: flush stale zero window, start with this sample
+
+          non-zero sample + abs(raw - current) >= transition_threshold
+            → transition_reset: flush stale same-weight window, start with this sample
+            Prevents old 38g samples from mixing with new 50g readings.
+
+          non-zero sample + small change (same stable weight)
+            → accept_same_weight: append to window, recompute median
+
+        Key invariant: the rolling window never contains samples from a different
+        stable weight than the current one.  Any confirmed transition clears it.
+        """
+        is_near_zero = abs(raw_value) <= self._zero_threshold
+
+        with self._cache_lock:
+            current = self._latest
+
+        if self._scale_debug:
+            window_before = list(self._raw_window)
+
+        if is_near_zero:
+            # ── Near-zero sample ─────────────────────────────────────────
+            if current is not None and abs(current) > self._zero_threshold:
+                # Current filtered is non-zero → require consecutive zeros.
+                self._zero_candidate_count += 1
+                if self._zero_candidate_count >= self._zero_confirm_samples:
+                    # Confirmed zero: flush ALL stale non-zero samples from window.
+                    self._raw_window.clear()
+                    self._raw_window.append(0.0)
+                    with self._cache_lock:
+                        self._latest = 0.0
+                    self._zero_candidate_count = 0
+                    if self._scale_debug:
+                        logger.debug(
+                            "[ScaleReader] action=confirm_zero_reset  raw=%.2f"
+                            "  before=%.2f  window_before=%s  window_after=%s  filtered=0.0",
+                            raw_value, current, window_before, list(self._raw_window),
+                        )
+                else:
+                    if self._scale_debug:
+                        logger.debug(
+                            "[ScaleReader] action=zero_candidate %d/%d  raw=%.2f"
+                            "  filtered=%.2f  (window unchanged)",
+                            self._zero_candidate_count, self._zero_confirm_samples,
+                            raw_value, current,
+                        )
+                return  # don't update window or _latest until confirmed
+            else:
+                # Already near zero or first reading — accept normally.
+                action = "accept_near_zero"
+                self._zero_candidate_count = 0
+        else:
+            # ── Non-zero sample ──────────────────────────────────────────
+            # Cancel any pending zero confirmation: a non-zero reading interrupts it.
+            self._zero_candidate_count = 0
+
+            if current is None:
+                action = "init"
+                self._raw_window.clear()
+            elif abs(current) <= self._zero_threshold:
+                # Transition: zero → non-zero.  Clear stale zero samples.
+                action = "zero_to_nonzero_reset"
+                self._raw_window.clear()
+            elif abs(raw_value - current) >= self._transition_threshold:
+                # Transition: significant weight change (e.g. 38g → 50g).
+                # Flush the window so old samples cannot dominate the new median.
+                action = "transition_reset"
+                self._raw_window.clear()
+            else:
+                action = "accept_same_weight"
+
+        # Common update: append accepted sample and recompute median.
+        self._raw_window.append(raw_value)
+        filtered = float(median(self._raw_window))
+        with self._cache_lock:
+            self._latest = filtered
+
+        if self._scale_debug:
+            logger.debug(
+                "[ScaleReader] action=%s  raw=%.2f  before=%s  window_before=%s"
+                "  window_after=%s  filtered=%.2f",
+                action, raw_value,
+                f"{current:.2f}" if current is not None else "None",
+                window_before, list(self._raw_window), filtered,
+            )
+
     def read_weight(self) -> Optional[float]:
         """
-        Drain up to `retries` buffered serial lines.  Update and return
-        the most recent valid weight.  Falls back to the cached value
-        (or None) if no new valid line is found.  Never raises.
+        Drain up to `retries` buffered serial lines.  Apply zero-rejection
+        debouncing and median filtering before updating the cached value.
+        Falls back to the cached value (or None) if no new valid line is found.
+        Never raises.
         """
         with self._lock:
             if not self._ensure_connected():
-                return self._latest  # return cached value while disconnected
+                return self._latest
 
             try:
                 for _ in range(self.retries):
@@ -159,7 +296,7 @@ class SerialScaleReader(BaseScaleReader):
                     line = raw.decode("utf-8", errors="ignore")
                     value = self._parse_line(line)
                     if value is not None:
-                        self._latest = value  # always take the most recent valid value
+                        self._apply_sample(value)
 
             except Exception as exc:
                 logger.warning("[ScaleReader] Unexpected error: %s", exc)
@@ -183,6 +320,11 @@ def create_scale_reader(
     baudrate: int,
     timeout: float,
     retries: int,
+    zero_threshold: float = 2.0,
+    zero_confirm_samples: int = 3,
+    filter_window: int = 3,
+    transition_threshold: float = 5.0,
+    debug: bool = False,
 ) -> BaseScaleReader:
     if mode == "mock":
         return MockScaleReader(mock_weight=mock_weight)
@@ -192,5 +334,10 @@ def create_scale_reader(
             baudrate=baudrate,
             timeout=timeout,
             retries=retries,
+            zero_threshold=zero_threshold,
+            zero_confirm_samples=zero_confirm_samples,
+            filter_window=filter_window,
+            transition_threshold=transition_threshold,
+            debug=debug,
         )
     raise ValueError(f"Unsupported scale reader mode: '{mode}'. Choose 'mock' or 'serial'.")

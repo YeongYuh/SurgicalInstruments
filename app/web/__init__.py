@@ -26,6 +26,11 @@ scale_reader = create_scale_reader(
     baudrate=config.SERIAL_BAUDRATE,
     timeout=config.SERIAL_TIMEOUT,
     retries=config.SERIAL_READ_RETRIES,
+    zero_threshold=config.SCALE_ZERO_THRESHOLD_GRAMS,
+    zero_confirm_samples=config.SCALE_ZERO_CONFIRM_SAMPLES,
+    filter_window=config.SCALE_FILTER_WINDOW,
+    transition_threshold=config.SCALE_TRANSITION_THRESHOLD_GRAMS,
+    debug=config.SCALE_DEBUG,
 )
 atexit.register(scale_reader.close)
 

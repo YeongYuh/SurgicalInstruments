@@ -33,6 +33,19 @@ SERIAL_BAUDRATE     = int(os.environ.get("SERIAL_BAUDRATE", "9600"))
 SERIAL_TIMEOUT      = float(os.environ.get("SERIAL_TIMEOUT", "2.0"))
 SERIAL_READ_RETRIES = int(os.environ.get("SERIAL_READ_RETRIES", "5"))
 
+# Scale signal quality — zero-rejection debounce + median filter
+# Readings whose absolute value is <= threshold are treated as zero candidates.
+SCALE_ZERO_THRESHOLD_GRAMS = float(os.environ.get("SCALE_ZERO_THRESHOLD_GRAMS", "2.0"))
+# How many consecutive near-zero readings required before accepting zero.
+SCALE_ZERO_CONFIRM_SAMPLES = int(os.environ.get("SCALE_ZERO_CONFIRM_SAMPLES", "3"))
+# Rolling-median window size (last N accepted non-zero reads + confirmed zeros).
+SCALE_FILTER_WINDOW        = int(os.environ.get("SCALE_FILTER_WINDOW", "3"))
+# If the raw reading differs from current filtered value by >= this many grams,
+# treat it as a real weight transition and flush the stale window.
+SCALE_TRANSITION_THRESHOLD_GRAMS = float(os.environ.get("SCALE_TRANSITION_THRESHOLD_GRAMS", "5.0"))
+# Log every raw/filtered sample when true.
+SCALE_DEBUG                = os.environ.get("SCALE_DEBUG", "false").lower() == "true"
+
 # Source type — "image" | "webcam"
 SOURCE_TYPE = os.environ.get("SOURCE_TYPE", "image")
 
@@ -66,6 +79,10 @@ CAMERA_FOURCC             = os.environ.get("CAMERA_FOURCC", "MJPG").upper()
 CAMERA_DEBUG              = os.environ.get("CAMERA_DEBUG", "false").lower() == "true"
 WEBCAM_DETECTION_INTERVAL = float(os.environ.get("WEBCAM_DETECTION_INTERVAL", "5.0"))
 WEBCAM_SAVE_FRAMES        = os.environ.get("WEBCAM_SAVE_FRAMES", "false").lower() == "true"
+# Inference image size for camera recognition (width=height).
+# Smaller values reduce CPU cost: 640 (full, default), 416, 320.
+# Upload inference always uses 640 regardless of this setting.
+CAMERA_INFERENCE_IMGSZ    = int(os.environ.get("CAMERA_INFERENCE_IMGSZ", "640"))
 
 # Web server
 BACKEND_HOST = os.environ.get("BACKEND_HOST", "0.0.0.0")
