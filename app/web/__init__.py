@@ -80,7 +80,37 @@ if _UNIT_WEIGHTS_FILE.exists():
     except Exception:
         unit_weights = {}
 
+# Per-class instrument weight from model definition — read-only source of truth
+# for standard weight calculation (标准重量).
+# Loaded once at startup from CLASS_WEIGHT_PATH (default: models/class_weight.json).
+_CLASS_WEIGHT_PATH = Path(config.CLASS_WEIGHT_PATH)
+_cw_logger = _logging.getLogger(__name__)
+class_weights: dict[str, float] = {}
+if _CLASS_WEIGHT_PATH.exists():
+    try:
+        _raw_cw = json.loads(_CLASS_WEIGHT_PATH.read_text(encoding="utf-8"))
+        class_weights = {str(k): float(v) for k, v in _raw_cw.items()}
+        _cw_logger.info(
+            "[class_weights] loaded %d classes from %s",
+            len(class_weights), _CLASS_WEIGHT_PATH,
+        )
+    except Exception as _exc:
+        _cw_logger.warning(
+            "[class_weights] failed to load %s: %s — standard weight will be 0",
+            _CLASS_WEIGHT_PATH, _exc,
+        )
+else:
+    _cw_logger.warning(
+        "[class_weights] %s not found — standard weight will be 0", _CLASS_WEIGHT_PATH,
+    )
+
 state_lock = threading.Lock()
+
+# Serialises camera start and stop operations so that a new open can never race
+# with an in-progress cap.release().  Both /camera/start and /camera/stop acquire
+# this lock for the duration of their device-level work (but NOT during
+# wait_until_ready, so the UI is not frozen while the camera warms up).
+_camera_lifecycle_lock = threading.Lock()
 
 # Camera thread — set by routes.py after start
 camera_thread = None  # type: ignore[assignment]
@@ -104,12 +134,28 @@ def compute_weight_verification(
     actual_weight: float | None,
     tolerance: float,
 ) -> dict:
-    """Calculate expected weight from BOM and compare with actual scale reading."""
-    all_classes = set(list(standards.keys()) + list(unit_weights.keys()))
-    expected = sum(
-        standards.get(cls, 0) * unit_weights.get(cls, 0.0)
-        for cls in all_classes
-    )
+    """Calculate expected weight from standards × unit weights and compare with actual scale reading.
+
+    Callers should pass class_weights (from class_weight.json) as unit_weights so
+    that standard weight is derived from the model definition rather than the
+    user-editable output/unit_weights.json file.
+
+    Classes present in standards but absent from unit_weights are logged as
+    warnings and contribute 0 g (no crash).
+    """
+    _wv_log = _logging.getLogger(__name__)
+    expected = 0.0
+    for cls, std_qty in standards.items():
+        qty = int(std_qty or 0)
+        if qty == 0:
+            continue
+        if cls not in unit_weights:
+            _wv_log.warning(
+                "[weight_verification] class '%s' (std=%d) not in class_weight.json — 0 g",
+                cls, qty,
+            )
+            continue
+        expected += qty * float(unit_weights[cls])
     if actual_weight is None:
         return {
             "passed": False,

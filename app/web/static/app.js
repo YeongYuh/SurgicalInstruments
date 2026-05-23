@@ -7,8 +7,9 @@ const CLIENT_ID = Date.now() + '-' + Math.random().toString(16).slice(2);
 let appInitialized = false;   // guards DOMContentLoaded against duplicate fires
 
 // ── State ─────────────────────────────────────────────────────────────────
-let standards   = {};   // {class_name: int}
-let unitWeights = {};   // {class_name: float}
+let standards    = {};   // {class_name: int}
+let unitWeights  = {};   // {class_name: float}  (output/unit_weights.json — legacy)
+let classWeights = {};   // {class_name: float}  (models/class_weight.json — source of truth)
 let lastCounts  = {};
 let cameraActive      = false;
 let recognitionActive = false;
@@ -39,6 +40,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   initChart();
   await fetchStandards();
   await fetchUnitWeights();
+  await fetchClassWeights();
   // Resolve camera state from the server BEFORE starting the poll loop so
   // the first pollStatus() does not see a stale cameraActive=false and
   // accidentally restore an old annotated image via syncCameraUI().
@@ -145,6 +147,14 @@ async function fetchUnitWeights() {
   } catch (e) { console.error('fetchUnitWeights:', e); }
 }
 
+async function fetchClassWeights() {
+  try {
+    const res = await fetch('/class_weights');
+    classWeights = await res.json();
+    console.debug('[init] classWeights loaded: ' + Object.keys(classWeights).length + ' classes');
+  } catch (e) { console.error('fetchClassWeights:', e); }
+}
+
 function scheduleUnitWeightsSync() {
   clearTimeout(uwDebounce);
   uwDebounce = setTimeout(pushUnitWeights, 300);
@@ -209,11 +219,17 @@ function renderWeightVerification(wv) {
 function refreshWeightVerification() {
   const lastWV = _lastKnownWV;
   if (!lastWV) return;
-  // Recompute expected from current local state
+  // Recompute expected from standards × classWeights (models/class_weight.json).
+  // classWeights is the source of truth; unitWeights (output/unit_weights.json) is not used here.
   let expected = 0;
-  const allCls = new Set([...Object.keys(standards), ...Object.keys(unitWeights)]);
-  allCls.forEach(cls => {
-    expected += (standards[cls] || 0) * (unitWeights[cls] || 0);
+  Object.entries(standards).forEach(([cls, std]) => {
+    const qty = parseInt(std) || 0;
+    if (qty === 0) return;
+    if (!Object.prototype.hasOwnProperty.call(classWeights, cls)) {
+      console.warn('[weight] class "' + cls + '" not in class_weight.json — 0 g');
+      return;
+    }
+    expected += qty * (classWeights[cls] || 0);
   });
   const actual = lastWV.actual;
   const tolerance = lastWV.tolerance;

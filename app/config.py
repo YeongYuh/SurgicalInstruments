@@ -8,6 +8,9 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
 # Detection
 CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.25"))
 
+# Per-class unit weight file (maps class name → grams per instrument)
+CLASS_WEIGHT_PATH = os.environ.get("CLASS_WEIGHT_PATH", "models/class_weight.json")
+
 # Detector backend — "pt" (default) or "onnx"
 # ONNX is ~3x faster on CPU (onnxruntime CPUExecutionProvider).
 # Set STRICT_DETECTOR_BACKEND=true to crash instead of falling back to .pt.
@@ -30,8 +33,15 @@ MOCK_WEIGHT         = float(os.environ.get("MOCK_WEIGHT", "1520.35"))
 # Run: sudo usermod -aG dialout $USER  (then re-login) for serial access.
 SERIAL_PORT         = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")
 SERIAL_BAUDRATE     = int(os.environ.get("SERIAL_BAUDRATE", "9600"))
-SERIAL_TIMEOUT      = float(os.environ.get("SERIAL_TIMEOUT", "2.0"))
+# Timeout per readline() call.  Kept short (0.1 s) so the background scale
+# poll thread never blocks longer than one interval when the serial buffer is
+# momentarily empty.  Raise via env var if your Arduino outputs slower than 10 Hz.
+SERIAL_TIMEOUT      = float(os.environ.get("SERIAL_TIMEOUT", "0.1"))
 SERIAL_READ_RETRIES = int(os.environ.get("SERIAL_READ_RETRIES", "5"))
+
+# How often the background scale poll thread drains the serial buffer (seconds).
+# 0.1 s = 10 Hz — keeps the weight cache fresh without blocking the web threads.
+SCALE_BG_POLL_INTERVAL = float(os.environ.get("SCALE_BG_POLL_INTERVAL", "0.1"))
 
 # Scale signal quality — zero-rejection debounce + median filter
 # Readings whose absolute value is <= threshold are treated as zero candidates.
