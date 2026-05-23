@@ -485,10 +485,21 @@ async function pollStatus() {
       setUpdateTime(data.timestamp);
     }
 
-    // Weight display is owned by pollWeight() / startWeightPolling() — only active
-    // during recognition.  pollStatus() does not touch weight_verification so that
-    // stopping recognition freezes the display at the last measured value and
-    // weight polling does not silently restart via the status poll.
+    // 標準重量: update whenever new recognition results arrive via /status.
+    // weight_verification.expected is computed server-side from class_weight.json
+    // so it is authoritative; render it immediately alongside any count update.
+    // 實際重量 is kept fresh by pollWeight() at 500 ms during recognition.
+    if (shouldRenderCounts && data.weight_verification) {
+      _lastKnownWV = data.weight_verification;
+      console.debug('[wv] pollStatus source=status'
+        + ' expected=' + data.weight_verification.expected
+        + ' actual=' + data.weight_verification.actual
+        + ' passed=' + data.weight_verification.passed);
+      renderWeightVerification(data.weight_verification);
+    }
+
+    // pollWeight() owns 實際重量 during recognition — it may run between status polls
+    // and will update _lastKnownWV with a fresher actual value via renderWeightVerification.
 
     // Annotated images are only shown by explicit user actions (upload / recognize).
     // pollStatus() never touches the image area — avoids stale camera frames
