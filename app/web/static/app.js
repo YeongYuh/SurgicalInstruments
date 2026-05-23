@@ -214,35 +214,56 @@ function renderWeightVerification(wv) {
   }
 }
 
-// Compute expected weight locally from current standards + unit weights
-// and trigger a re-render with the last known actual weight.
+// Delegates to recalculateExpectedAndRender — kept so pushStandards / pushUnitWeights
+// callers do not need to change.
 function refreshWeightVerification() {
-  const lastWV = _lastKnownWV;
-  if (!lastWV) return;
-  // Recompute expected from standards × classWeights (models/class_weight.json).
-  // classWeights is the source of truth; unitWeights (output/unit_weights.json) is not used here.
+  recalculateExpectedAndRender('standard-edit');
+}
+
+// ── Single source of truth for 標準重量 ────────────────────────────────────
+// expected is ALWAYS computed here from the current frontend standards × classWeights.
+// Backend weight_verification.expected is never trusted after initial receipt —
+// every caller that receives a backend wv must:
+//   1. update _lastKnownWV.actual and .tolerance (scale / inference data)
+//   2. then call recalculateExpectedAndRender() to recompute expected locally
+// This prevents the 2-second pollStatus() cycle from overwriting manual standard edits.
+function recalculateExpectedAndRender(source) {
+  if (_lastKnownWV == null) return;   // no recognition context yet — keep '未量測' state
+
   let expected = 0;
+  const debugParts = [];
   Object.entries(standards).forEach(([cls, std]) => {
-    const qty = parseInt(std) || 0;
-    if (qty === 0) return;
-    if (!Object.prototype.hasOwnProperty.call(classWeights, cls)) {
-      console.warn('[weight] class "' + cls + '" not in class_weight.json — 0 g');
+    const qty = Number(std);   // Number("0")=0  Number("")=0  Number(undefined)=NaN
+    if (!Number.isFinite(qty) || qty === 0) return;   // 0 contributes nothing; NaN is invalid
+    const uw = Number(classWeights[cls]);
+    if (!Number.isFinite(uw)) {
+      console.warn('[wv] class "' + cls + '" not in classWeights — 0 g');
       return;
     }
-    expected += qty * (classWeights[cls] || 0);
+    expected += qty * uw;
+    debugParts.push(cls + ':' + qty + '×' + uw + '=' + (qty * uw).toFixed(1));
   });
-  const actual = lastWV.actual;
-  const tolerance = lastWV.tolerance;
-  const diff = actual != null ? Math.abs(actual - expected) : null;
-  const passed = diff != null ? diff <= tolerance : false;
-  renderWeightVerification({
-    passed,
-    expected,
-    actual,
-    difference: diff,
-    tolerance,
-    message: diff == null ? '無法讀取重量' : (passed ? '重量在容許範圍內' : '重量超出容許範圍'),
-  });
+
+  const actual    = _lastKnownWV.actual;
+  const tolerance = _lastKnownWV.tolerance;
+  const diff      = (actual != null && tolerance != null) ? Math.abs(actual - expected) : null;
+  const passed    = diff != null ? diff <= tolerance : false;
+
+  // Patch _lastKnownWV so any subsequent call sees the fresh expected value.
+  _lastKnownWV.expected   = expected;
+  _lastKnownWV.difference = diff;
+  _lastKnownWV.passed     = passed;
+
+  console.debug('[wv] recalc source=' + source
+    + ' expected=' + expected.toFixed(1)
+    + ' actual=' + actual
+    + ' passed=' + passed
+    + (debugParts.length
+        ? '  classes=[' + debugParts.slice(0, 6).join(', ')
+          + (debugParts.length > 6 ? '…' : '') + ']'
+        : '  [no contributing classes]'));
+
+  renderWeightVerification(_lastKnownWV);
 }
 
 let _lastKnownWV = null;
@@ -486,20 +507,20 @@ async function pollStatus() {
     }
 
     // 標準重量: update whenever new recognition results arrive via /status.
-    // weight_verification.expected is computed server-side from class_weight.json
-    // so it is authoritative; render it immediately alongside any count update.
-    // 實際重量 is kept fresh by pollWeight() at 500 ms during recognition.
+    // Only take actual weight and tolerance from the backend response.
+    // Expected is always recomputed from current frontend standards × classWeights so
+    // that manual standard edits are never overwritten by the 2-second poll cycle.
     if (shouldRenderCounts && data.weight_verification) {
-      _lastKnownWV = data.weight_verification;
-      console.debug('[wv] pollStatus source=status'
-        + ' expected=' + data.weight_verification.expected
-        + ' actual=' + data.weight_verification.actual
-        + ' passed=' + data.weight_verification.passed);
-      renderWeightVerification(data.weight_verification);
+      if (_lastKnownWV == null) {
+        _lastKnownWV = { ...data.weight_verification };
+      } else {
+        _lastKnownWV.actual    = data.weight_verification.actual;
+        _lastKnownWV.tolerance = data.weight_verification.tolerance;
+      }
+      recalculateExpectedAndRender('pollStatus');
     }
 
-    // pollWeight() owns 實際重量 during recognition — it may run between status polls
-    // and will update _lastKnownWV with a fresher actual value via renderWeightVerification.
+    // recalculateExpectedAndRender owns expected; pollWeight() updates actual at 500 ms.
 
     // Annotated images are only shown by explicit user actions (upload / recognize).
     // pollStatus() never touches the image area — avoids stale camera frames
@@ -649,8 +670,14 @@ async function pollWeight({ final: isFinal = false, token = undefined, reason = 
       return;
     }
     if (data.weight_verification) {
-      _lastKnownWV = data.weight_verification;
-      renderWeightVerification(data.weight_verification);
+      // Update actual weight from scale (fresh read); recompute expected locally.
+      if (_lastKnownWV == null) {
+        _lastKnownWV = { ...data.weight_verification };
+      } else {
+        _lastKnownWV.actual    = data.weight_verification.actual;
+        _lastKnownWV.tolerance = data.weight_verification.tolerance;
+      }
+      recalculateExpectedAndRender('pollWeight');
     }
   } catch (e) {
     if (e.name === 'AbortError') {
@@ -779,8 +806,15 @@ async function startRecognize() {
         setUpdateTime(data.timestamp);
         showAnnotatedImage(data.annotated_image);
         if (data.weight_verification) {
-          _lastKnownWV = data.weight_verification;
-          renderWeightVerification(data.weight_verification);
+          // Seed _lastKnownWV with actual weight and tolerance from backend;
+          // recompute expected from current standards × classWeights.
+          if (_lastKnownWV == null) {
+            _lastKnownWV = { ...data.weight_verification };
+          } else {
+            _lastKnownWV.actual    = data.weight_verification.actual;
+            _lastKnownWV.tolerance = data.weight_verification.tolerance;
+          }
+          recalculateExpectedAndRender('upload');
         }
       } else {
         alert('辨識失敗：' + (data.error || '未知錯誤'));
