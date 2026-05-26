@@ -97,3 +97,8 @@ CAMERA_INFERENCE_IMGSZ    = int(os.environ.get("CAMERA_INFERENCE_IMGSZ", "640"))
 # Web server
 BACKEND_HOST = os.environ.get("BACKEND_HOST", "0.0.0.0")
 BACKEND_PORT = int(os.environ.get("BACKEND_PORT", "5000"))
+
+# Safety gate for the 安全關機 web button.
+# Set ENABLE_SYSTEM_SHUTDOWN=true AND configure sudoers (see docs/DEPLOY_JETSON.md)
+# before enabling.  When false the route returns an error without touching hardware.
+ENABLE_SYSTEM_SHUTDOWN = os.environ.get("ENABLE_SYSTEM_SHUTDOWN", "false").lower() == "true"

@@ -676,3 +676,45 @@ def post_unit_weights():
         web_pkg.unit_weights.update(parsed)
         _save_json(_UNIT_WEIGHTS_FILE, web_pkg.unit_weights)
     return jsonify(ok=True)
+
+
+@app.route("/system/shutdown", methods=["POST"])
+def system_shutdown():
+    """Safe shutdown: stop recognition/camera/scale, then trigger OS poweroff.
+
+    Protected by ENABLE_SYSTEM_SHUTDOWN env var so the button is harmless by
+    default.  Requires sudoers entry (see docs/DEPLOY_JETSON.md).
+    """
+    if not config.ENABLE_SYSTEM_SHUTDOWN:
+        return jsonify(
+            ok=False,
+            error="System shutdown disabled. Set ENABLE_SYSTEM_SHUTDOWN=true to enable.",
+        ), 403
+
+    # Stop recognition and camera so /dev/video0 is released before OS halt.
+    with web_pkg.state_lock:
+        cam = web_pkg.camera_thread
+    if cam is not None:
+        cam.stop_recognition()
+        cam.stop()
+
+    # Stop scale background polling thread.
+    _stop_scale_bg_poll()
+
+    # Fire-and-forget: give the HTTP response ~0.5 s to reach the browser, then
+    # issue the shutdown command.  subprocess.Popen does not block Flask.
+    import subprocess
+    import threading
+
+    def _do_shutdown() -> None:
+        import time as _time
+        _time.sleep(0.5)
+        try:
+            subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+            logger.info("[shutdown] shutdown command issued")
+        except Exception as exc:
+            logger.error("[shutdown] Failed to invoke shutdown: %s", exc)
+
+    threading.Thread(target=_do_shutdown, name="shutdown-trigger", daemon=True).start()
+    logger.info("[shutdown] shutdown scheduled by web UI")
+    return jsonify(ok=True, message="Shutdown scheduled")
