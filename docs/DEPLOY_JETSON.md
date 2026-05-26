@@ -23,10 +23,11 @@
 13. [安全關機按鈕設定](#13-安全關機按鈕設定)
 14. [瀏覽器操作說明](#14-瀏覽器操作說明)
 15. [Kiosk / 觸控螢幕模式](#15-kiosk--觸控螢幕模式)
-16. [驗證清單](#16-驗證清單)
-17. [常見問題排查](#17-常見問題排查)
-18. [Git 注意事項](#18-git-注意事項)
-19. [最終快速驗證指令](#19-最終快速驗證指令)
+16. [開機自動啟動與 Kiosk 全螢幕](#16-開機自動啟動與-kiosk-全螢幕)
+17. [驗證清單](#17-驗證清單)
+18. [常見問題排查](#18-常見問題排查)
+19. [Git 注意事項](#19-git-注意事項)
+20. [最終快速驗證指令](#20-最終快速驗證指令)
 
 ---
 
@@ -347,16 +348,19 @@ sudo apt install -y \
 - `python3.8`：本專案 venv 所需，Ubuntu 18.04 預設只有 3.6，需手動安裝
 - `python3.8-venv`：建立虛擬環境所需
 - `python3.8-distutils`：pip 安裝部分套件時需要
+- `git`：從 GitHub 下載專案所需
+- `curl`：**`scripts/start_kiosk.sh` 的必要依賴**，用於等待 Flask 伺服器就緒再開啟 Chromium；若缺少 curl，Kiosk 腳本會立即失敗
 - `libgl1` / `libglib2.0-0`：OpenCV 執行時期依賴（無 GUI 環境常缺少）
 
-**選用的診斷工具**（非必要，但方便除錯）：
+**選用的診斷工具與 Kiosk 工具**：
 
 ```bash
-sudo apt install -y v4l-utils usbutils
+sudo apt install -y v4l-utils usbutils unclutter
 ```
 
 - `v4l-utils`：提供 `v4l2-ctl` 指令，可查詢攝影機支援格式
 - `usbutils`：提供 `lsusb` 指令，可確認 USB 裝置識別
+- `unclutter`：Kiosk 模式下自動隱藏滑鼠游標（閒置 1 秒後消失）；`start_kiosk.sh` 若偵測到 `unclutter` 即自動啟用，未安裝時略過
 
 **確認 Python 3.8 安裝成功**：
 
@@ -852,13 +856,22 @@ Flask 應用程式以一般使用者身份執行（例如 `camlion`），必須�
 sudo visudo -f /etc/sudoers.d/instrument-shutdown
 ```
 
+> 若系統未安裝 `nano`，`visudo` 預設開啟 `vi`。vi 操作方式：按 `i` 進入插入模式，輸入內容後按 `Esc`，再輸入 `:wq` 儲存離開。
+> 若偏好 nano，先安裝：`sudo apt install -y nano`
+
 **步驟 2 — 在編輯器中輸入以下內容（將 `camlion` 改為實際使用者名稱）：**
 
 ```
 camlion ALL=(root) NOPASSWD: /sbin/shutdown, /sbin/poweroff, /usr/sbin/shutdown, /usr/sbin/poweroff
 ```
 
-**步驟 3 — 儲存並驗證語法：**
+**步驟 3 — 設定正確的檔案權限：**
+
+```bash
+sudo chmod 440 /etc/sudoers.d/instrument-shutdown
+```
+
+**步驟 4 — 驗證語法：**
 
 ```bash
 sudo visudo -c -f /etc/sudoers.d/instrument-shutdown
@@ -866,7 +879,7 @@ sudo visudo -c -f /etc/sudoers.d/instrument-shutdown
 
 輸出應為 `/etc/sudoers.d/instrument-shutdown: parsed OK`。
 
-**步驟 4 — 測試免密碼關機（先不要真的關機）：**
+**步驟 5 — 測試免密碼關機（先不要真的關機）：**
 
 ```bash
 sudo -n /sbin/shutdown --help 2>&1 | head -1
@@ -919,7 +932,7 @@ http://<Jetson IP>:5000
 ### Flask 記錄說明
 
 - Flask 記錄中每約 2 秒出現一筆 `/status?client=...` 是**正常現象**，代表前端輪詢正常運作，**不是錯誤，不需要處理**。
-- `/api/weight?client=...` **只應在辨識進行中出現**。若辨識停止後仍持續出現，請查看第 17 節 F 項。
+- `/api/weight?client=...` **只應在辨識進行中出現**。若辨識停止後仍持續出現，請查看第 18 節 F 項。
 
 ### 多分頁注意事項
 
@@ -952,7 +965,354 @@ firefox --kiosk http://127.0.0.1:5000
 
 ---
 
-## 16. 驗證清單
+## 16. 開機自動啟動與 Kiosk 全螢幕
+
+本節說明如何讓 Flask 伺服器在開機後自動啟動，並在桌面登入後自動開啟 Chromium Kiosk 全螢幕模式。所有腳本已放置於 `scripts/` 和 `deploy/` 目錄中。
+
+### A. 安裝 Flask 伺服器自動啟動（systemd）
+
+```bash
+cd /home/camlion/projects/instrument
+sudo scripts/install_autostart_server.sh
+```
+
+此腳本會：
+
+1. 將 `deploy/systemd/instrument-server.service` 複製到 `/etc/systemd/system/`
+2. 執行 `systemctl daemon-reload`
+3. 啟用並重啟 `instrument-server.service`（含 `ENABLE_SYSTEM_SHUTDOWN=true`）
+
+**安裝後驗證**：
+
+```bash
+# 確認服務為 active (running)
+systemctl status instrument-server.service --no-pager
+
+# 確認 Flask 監聽 0.0.0.0:5000
+ss -ltnp | grep 5000 || true
+
+# 查看啟動記錄（應有 ONNX 載入、Scale port、Shutdown ENABLED）
+journalctl -u instrument-server.service -n 100 --no-pager
+```
+
+啟動記錄預期包含：
+
+```
+  onnxruntime: <版本>  providers=[CPUExecutionProvider]
+  Scale port : /dev/ttyUSB0  (baud=9600)
+               -> port found OK
+  Shutdown   : ENABLED
+```
+
+### B. 查看伺服器日誌
+
+```bash
+# 目前狀態
+systemctl status instrument-server.service --no-pager
+
+# 即時追蹤日誌
+journalctl -u instrument-server.service -f
+
+# 查看最近 100 行
+journalctl -u instrument-server.service -n 100 --no-pager
+```
+
+### C. 安裝 Kiosk 桌面自動啟動
+
+```bash
+scripts/install_kiosk_autostart.sh
+```
+
+此腳本會：
+
+1. 將 `deploy/autostart/instrument-kiosk.desktop` 複製到 `~/.config/autostart/`
+2. 建立 Chromium 專用設定目錄 `~/.config/instrument-chromium`
+3. 設定正確的擁有者和權限
+
+**安裝後驗證**：
+
+```bash
+ls -l /home/camlion/.config/autostart/instrument-kiosk.desktop
+cat /home/camlion/.config/autostart/instrument-kiosk.desktop
+```
+
+預期 `.desktop` 內容：
+
+```
+[Desktop Entry]
+Type=Application
+Name=Instrument Kiosk
+Comment=Launch Instrument Recognition Kiosk
+Exec=/home/camlion/projects/instrument/scripts/start_kiosk.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true
+```
+
+> **注意**：`~/.config/autostart/` 只在使用者完成圖形桌面登入後才會執行。若要完全無人值守開機，需在顯示管理員（LightDM）中啟用 `camlion` 自動登入，詳見下方 J 項。
+
+`start_kiosk.sh` 啟動時會等待 Flask 伺服器在 `http://127.0.0.1:5000` 就緒（最多 120 秒）後再開啟 Chromium，確保頁面不會在伺服器啟動前載入。
+
+### D. 停用螢幕休眠與螢幕保護程式
+
+在桌面 session 中執行：
+
+```bash
+scripts/disable_sleep_blanking.sh
+```
+
+此腳本執行以下指令（失敗自動忽略）：
+
+```bash
+xset s off
+xset s noblank
+xset -dpms
+gsettings set org.gnome.desktop.session idle-delay 0
+gsettings set org.gnome.desktop.screensaver lock-enabled false
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing'
+```
+
+若要永久套用，可選擇性編輯 `/etc/systemd/logind.conf`（需 root）：
+
+```
+HandleLidSwitch=ignore
+IdleAction=ignore
+IdleActionSec=0
+```
+
+然後執行 `sudo systemctl restart systemd-logind`。
+
+### E. 重新開機測試
+
+```bash
+sudo reboot
+```
+
+重開機後預期行為：
+
+| 步驟 | 時序 | 預期 |
+|------|------|------|
+| 1 | 開機完成 | `camlion` 自動登入（LightDM） |
+| 2 | systemd 啟動 | `instrument-server.service` 自動啟動，Flask 監聽 0.0.0.0:5000 |
+| 3 | 桌面 session 啟動 | `~/.config/autostart/instrument-kiosk.desktop` 觸發 `start_kiosk.sh` |
+| 4 | 等待伺服器 | `start_kiosk.sh` 以 `curl` 輪詢 `http://127.0.0.1:5000`，最多等 120 秒 |
+| 5 | 伺服器就緒 | Chromium 以 Kiosk 全螢幕模式開啟，顯示 Web UI |
+| 6 | 操作中 | 螢幕不休眠、不出現螢幕保護程式；⏻ 安全關機按鈕可用 |
+
+啟動記錄診斷（`run_jetson.sh` 輸出）確認項目：
+
+- ONNX Runtime 已載入（`providers=[CPUExecutionProvider]`）
+- 攝影機路徑存在（`/dev/video0`）
+- Scale port 找到（`port found OK`）
+- `Shutdown   : ENABLED`（`ENABLE_SYSTEM_SHUTDOWN=true` 時）
+
+### F. 排錯
+
+**Kiosk 顯示「waiting for Flask server on http://127.0.0.1:5000」且持續等待：**
+
+先確認 Flask 是否確實監聽：
+```bash
+ss -ltnp | grep 5000 || true
+```
+
+若 Flask 有在監聽但 Kiosk 仍在等待，確認 `curl` 是否安裝：
+```bash
+which curl
+curl -I http://127.0.0.1:5000
+```
+
+若 `curl` 未安裝：
+```bash
+sudo apt install -y curl
+```
+
+---
+
+**`curl: command not found`**
+
+原因：`curl` 未安裝（§5 必要套件）。
+
+修復：
+```bash
+sudo apt install -y curl
+```
+
+---
+
+**Chromium 未開啟（伺服器正在執行）：**
+
+```bash
+# 確認自動登入設定
+cat /etc/lightdm/lightdm.conf
+
+# 確認 .desktop 檔案存在
+ls -l /home/camlion/.config/autostart/instrument-kiosk.desktop
+cat /home/camlion/.config/autostart/instrument-kiosk.desktop
+
+# 確認 Chromium 是否正在執行
+ps aux | grep -i chromium
+ps aux | grep -i start_kiosk
+```
+
+最常見原因：LightDM 自動登入未設定（見 J 項），`~/.config/autostart/` 從未執行。
+
+**手動測試 Kiosk（在有桌面 session 的情況下）：**
+```bash
+DISPLAY=:0 /home/camlion/projects/instrument/scripts/start_kiosk.sh
+```
+
+---
+
+**伺服器未啟動：**
+```bash
+systemctl status instrument-server.service
+journalctl -u instrument-server.service -n 100 --no-pager
+```
+常見原因：venv 路徑錯誤、模型檔案不存在、串列埠被佔用。
+
+**手動測試伺服器腳本（Ctrl+C 停止）：**
+```bash
+./scripts/start_instrument_server.sh
+```
+
+---
+
+**編輯設定檔時 `nano: command not found`：**
+
+使用 `vi` 代替：
+```bash
+sudo vi /etc/lightdm/lightdm.conf
+# 操作：i 進入插入模式，Esc 離開插入，:wq 儲存
+```
+
+或先安裝 nano：
+```bash
+sudo apt install -y nano
+```
+
+或使用本指南中的 `sudo tee` 指令，無需文字編輯器。
+
+---
+
+**Chrome 出現「上次未正常關閉」泡泡：**
+- `start_kiosk.sh` 已加入 `--disable-session-crashed-bubble` 和 `--disable-infobars` 旗標。
+
+---
+
+**螢幕仍然休眠：**
+```bash
+xset q   # 查看目前 DPMS / screensaver 狀態
+```
+再次執行 `scripts/disable_sleep_blanking.sh` 或設定 LightDM 的 `xserver-command` 加入 `-s 0 -dpms`。
+
+### G. 停止 / 停用自動啟動
+
+停用 systemd 伺服器服務：
+
+```bash
+sudo systemctl stop instrument-server.service
+sudo systemctl disable instrument-server.service
+```
+
+移除 Kiosk 自動啟動：
+
+```bash
+rm ~/.config/autostart/instrument-kiosk.desktop
+```
+
+### H. 手動測試腳本
+
+在安裝前可先手動測試各腳本：
+
+```bash
+# 測試伺服器啟動腳本（Ctrl+C 停止）
+./scripts/start_instrument_server.sh
+
+# 測試 Kiosk 腳本（需在桌面 session 中，手動關閉 Chromium）
+./scripts/start_kiosk.sh
+
+# 測試停用螢幕休眠
+./scripts/disable_sleep_blanking.sh
+```
+
+### I. 完整一次性安裝指令
+
+所有元件設定完成後，可依序執行以下完整流程：
+
+```bash
+cd /home/camlion/projects/instrument
+
+# 1. 安裝 systemd 服務
+sudo scripts/install_autostart_server.sh
+
+# 2. 安裝 Kiosk 桌面自動啟動
+scripts/install_kiosk_autostart.sh
+
+# 3. 停用螢幕休眠（在桌面 session 中執行）
+scripts/disable_sleep_blanking.sh
+
+# 4. 設定 LightDM 自動登入（備份現有設定後覆寫）
+sudo cp /etc/lightdm/lightdm.conf /etc/lightdm/lightdm.conf.bak 2>/dev/null || true
+sudo tee /etc/lightdm/lightdm.conf >/dev/null <<'EOF'
+[Seat:*]
+autologin-user=camlion
+autologin-user-timeout=0
+EOF
+
+# 5. 設定安全關機 sudoers（見 §13）
+sudo visudo -f /etc/sudoers.d/instrument-shutdown
+sudo chmod 440 /etc/sudoers.d/instrument-shutdown
+sudo visudo -c -f /etc/sudoers.d/instrument-shutdown
+
+# 6. 重開機
+sudo reboot
+```
+
+### J. 啟用桌面自動登入（LightDM）
+
+> **重要**：若未設定自動登入，Chromium Kiosk 在重開機後不會自動啟動（因為 `~/.config/autostart/` 僅在圖形 session 啟動後執行）。若只需要 Flask 伺服器自動啟動（無 Kiosk），可略過此步驟。
+
+若使用 LightDM（Jetson Nano Ubuntu 18.04 預設）：
+
+```bash
+# 備份現有設定
+sudo cp /etc/lightdm/lightdm.conf /etc/lightdm/lightdm.conf.bak 2>/dev/null || true
+
+# 寫入自動登入設定（推薦方式，不需要 nano）
+sudo tee /etc/lightdm/lightdm.conf >/dev/null <<'EOF'
+[Seat:*]
+autologin-user=camlion
+autologin-user-timeout=0
+EOF
+```
+
+或使用文字編輯器手動修改：
+
+```bash
+sudo nano /etc/lightdm/lightdm.conf
+# 若未安裝 nano：sudo apt install -y nano
+# 或使用 vi：sudo vi /etc/lightdm/lightdm.conf
+```
+
+**驗證設定**：
+
+```bash
+cat /etc/lightdm/lightdm.conf
+```
+
+預期輸出：
+
+```
+[Seat:*]
+autologin-user=camlion
+autologin-user-timeout=0
+```
+
+重開機後即自動登入 `camlion`，Kiosk 隨之啟動。
+
+---
+
+## 17. 驗證清單
 
 完成部署後，逐一確認以下項目：
 
@@ -971,7 +1331,7 @@ firefox --kiosk http://127.0.0.1:5000
 
 ---
 
-## 17. 常見問題排查
+## 18. 常見問題排查
 
 ### A. `source venv/bin/activate` 後仍是系統 Python 3.6
 
@@ -1094,7 +1454,7 @@ CAMERA_INFERENCE_IMGSZ=416 ./run_jetson.sh
 
 ---
 
-## 18. Git 注意事項
+## 19. Git 注意事項
 
 ### 不應提交的檔案
 
@@ -1135,7 +1495,7 @@ git log --oneline -5
 
 ---
 
-## 19. 最終快速驗證指令
+## 20. 最終快速驗證指令
 
 完成所有設定後，依序執行以下指令作為最終確認：
 
