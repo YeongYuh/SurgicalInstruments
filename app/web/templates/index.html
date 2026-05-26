@@ -43,7 +43,7 @@
           </div>
 
           <img id="preview-img" alt="preview" style="display:none">
-          <img id="camera-stream" alt="camera" style="display:none">
+          <img id="camera-stream" alt="camera" style="display:none" onerror="_onStreamError()">
           <input type="file" id="file-input" accept="image/*" style="display:none"
                  onchange="onFileChange(event)">
         </div>

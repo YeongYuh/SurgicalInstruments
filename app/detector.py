@@ -56,13 +56,17 @@ class SurgicalInstrumentDetector:
         self,
         source: Union[str, Path, np.ndarray],
         conf: float = 0.25,
+        imgsz: Optional[int] = None,
     ) -> tuple[Any, list[dict]]:
         """Accept a file path (str/Path) or a BGR numpy frame."""
         t_start = time.perf_counter()
         self._load_model()
 
         t_infer = time.perf_counter()
-        results = self._model(source, conf=conf, verbose=False)
+        kwargs: dict = {"conf": conf, "verbose": False}
+        if imgsz is not None:
+            kwargs["imgsz"] = imgsz
+        results = self._model(source, **kwargs)
         t_after_infer = time.perf_counter()
 
         result = results[0]
