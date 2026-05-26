@@ -20,12 +20,13 @@
 10. [電子秤串列埠設定](#10-電子秤串列埠設定)
 11. [環境變數](#11-環境變數)
 12. [啟動應用程式](#12-啟動應用程式)
-13. [瀏覽器操作說明](#13-瀏覽器操作說明)
-14. [Kiosk / 觸控螢幕模式](#14-kiosk--觸控螢幕模式)
-15. [驗證清單](#15-驗證清單)
-16. [常見問題排查](#16-常見問題排查)
-17. [Git 注意事項](#17-git-注意事項)
-18. [最終快速驗證指令](#18-最終快速驗證指令)
+13. [安全關機按鈕設定](#13-安全關機按鈕設定)
+14. [瀏覽器操作說明](#14-瀏覽器操作說明)
+15. [Kiosk / 觸控螢幕模式](#15-kiosk--觸控螢幕模式)
+16. [驗證清單](#16-驗證清單)
+17. [常見問題排查](#17-常見問題排查)
+18. [Git 注意事項](#18-git-注意事項)
+19. [最終快速驗證指令](#19-最終快速驗證指令)
 
 ---
 
@@ -821,7 +822,75 @@ Ctrl+C
 
 ---
 
-## 13. 瀏覽器操作說明
+## 13. 安全關機按鈕設定
+
+Web UI 右上角有一個「⏻ 安全關機」按鈕，點擊後會停止所有服務（攝影機、辨識、電子秤）並關閉 Jetson 系統電源。
+
+> **預設停用。** 需完成 sudoers 設定後才能啟用，否則按鈕會回傳 403 錯誤，不會執行任何操作。
+
+### A. 確認環境變數設定
+
+`run_jetson.sh` 中的預設值為：
+
+```bash
+export ENABLE_SYSTEM_SHUTDOWN="${ENABLE_SYSTEM_SHUTDOWN:-false}"
+```
+
+啟動時若不設定，關機按鈕功能停用。若要啟用，以下列方式執行：
+
+```bash
+ENABLE_SYSTEM_SHUTDOWN=true ./run_jetson.sh
+```
+
+### B. 設定 sudoers（必要步驟）
+
+Flask 應用程式以一般使用者身份執行（例如 `camlion`），必須允許該使用者免密碼執行 `shutdown`。
+
+**步驟 1 — 以 root 身份建立 sudoers 規則：**
+
+```bash
+sudo visudo -f /etc/sudoers.d/instrument-shutdown
+```
+
+**步驟 2 — 在編輯器中輸入以下內容（將 `camlion` 改為實際使用者名稱）：**
+
+```
+camlion ALL=(root) NOPASSWD: /sbin/shutdown, /sbin/poweroff, /usr/sbin/shutdown, /usr/sbin/poweroff
+```
+
+**步驟 3 — 儲存並驗證語法：**
+
+```bash
+sudo visudo -c -f /etc/sudoers.d/instrument-shutdown
+```
+
+輸出應為 `/etc/sudoers.d/instrument-shutdown: parsed OK`。
+
+**步驟 4 — 測試免密碼關機（先不要真的關機）：**
+
+```bash
+sudo -n /sbin/shutdown --help 2>&1 | head -1
+```
+
+若不出現密碼提示，代表 sudoers 設定正確。
+
+### C. 啟用並測試
+
+```bash
+ENABLE_SYSTEM_SHUTDOWN=true ./run_jetson.sh
+```
+
+開啟 Web UI 後點選右上角「⏻ 安全關機」按鈕，確認出現確認對話框。確認後系統將在約 0.5 秒後執行 `sudo shutdown -h now`。
+
+### D. 安全注意事項
+
+- 若 `ENABLE_SYSTEM_SHUTDOWN=false`（預設），按鈕點選後回傳 HTTP 403，不執行任何操作。
+- sudoers 規則僅允許 `shutdown` 和 `poweroff`，不開放其他 root 指令。
+- Kiosk 環境建議啟用此功能以便操作人員無鍵盤關機；一般開發環境保持停用。
+
+---
+
+## 14. 瀏覽器操作說明
 
 在同一網路的任何電腦或 Jetson 本機開啟瀏覽器，輸入：
 
@@ -850,7 +919,7 @@ http://<Jetson IP>:5000
 ### Flask 記錄說明
 
 - Flask 記錄中每約 2 秒出現一筆 `/status?client=...` 是**正常現象**，代表前端輪詢正常運作，**不是錯誤，不需要處理**。
-- `/api/weight?client=...` **只應在辨識進行中出現**。若辨識停止後仍持續出現，請查看第 16 節 F 項。
+- `/api/weight?client=...` **只應在辨識進行中出現**。若辨識停止後仍持續出現，請查看第 17 節 F 項。
 
 ### 多分頁注意事項
 
@@ -860,7 +929,7 @@ http://<Jetson IP>:5000
 
 ---
 
-## 14. Kiosk / 觸控螢幕模式
+## 15. Kiosk / 觸控螢幕模式
 
 若使用 7 吋 HDMI 顯示器作為固定顯示裝置，可用 Kiosk 模式全螢幕顯示 UI：
 
@@ -883,7 +952,7 @@ firefox --kiosk http://127.0.0.1:5000
 
 ---
 
-## 15. 驗證清單
+## 16. 驗證清單
 
 完成部署後，逐一確認以下項目：
 
@@ -902,7 +971,7 @@ firefox --kiosk http://127.0.0.1:5000
 
 ---
 
-## 16. 常見問題排查
+## 17. 常見問題排查
 
 ### A. `source venv/bin/activate` 後仍是系統 Python 3.6
 
@@ -1025,7 +1094,7 @@ CAMERA_INFERENCE_IMGSZ=416 ./run_jetson.sh
 
 ---
 
-## 17. Git 注意事項
+## 18. Git 注意事項
 
 ### 不應提交的檔案
 
@@ -1066,7 +1135,7 @@ git log --oneline -5
 
 ---
 
-## 18. 最終快速驗證指令
+## 19. 最終快速驗證指令
 
 完成所有設定後，依序執行以下指令作為最終確認：
 

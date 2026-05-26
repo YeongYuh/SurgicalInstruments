@@ -50,6 +50,10 @@ export WEBCAM_FPS="${WEBCAM_FPS:-15}"
 export CAMERA_FOURCC="${CAMERA_FOURCC:-YUYV}"
 export WEBCAM_DETECTION_INTERVAL="${WEBCAM_DETECTION_INTERVAL:-5}"
 
+# ── Safety gate for the web-UI shutdown button ────────────────────────────
+# Keep false unless sudoers is configured (see docs/DEPLOY_JETSON.md §13).
+export ENABLE_SYSTEM_SHUTDOWN="${ENABLE_SYSTEM_SHUTDOWN:-false}"
+
 # ── Startup diagnostics ──────────────────────────────────────────────────
 python3 - <<'PYEOF'
 import sys, platform, os
@@ -145,6 +149,10 @@ if mode == "serial":
         print("               -> set port:          SERIAL_PORT=/dev/ttyACM0 ./run_jetson.sh")
         print("               -> permission fix:    sudo usermod -aG dialout $USER  (re-login)")
         print("               -> no hardware:       SCALE_READER_MODE=mock ./run_jetson.sh")
+
+shutdown_enabled = os.environ.get("ENABLE_SYSTEM_SHUTDOWN", "false").lower() == "true"
+shutdown_label   = "ENABLED" if shutdown_enabled else "disabled  (set ENABLE_SYSTEM_SHUTDOWN=true to enable)"
+print(f"  Shutdown   : {shutdown_label}")
 
 print("=" * 56)
 PYEOF

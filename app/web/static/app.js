@@ -988,3 +988,22 @@ document.addEventListener('click', e => {
 // ── Downloads ─────────────────────────────────────────────────────────────
 function downloadReport() { window.location.href = '/report'; }
 function downloadBOM()    { window.location.href = '/bom_report'; }
+
+async function requestShutdown() {
+  if (!confirm('確定要關機？\n系統將停止所有程式並安全關閉。')) return;
+  const btn = document.getElementById('btn-shutdown');
+  if (btn) { btn.disabled = true; btn.textContent = '關機中…'; }
+  try {
+    const res = await fetch('/system/shutdown', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      alert('關機指令已送出，系統即將關閉。');
+    } else {
+      alert('關機失敗：' + (data.error || '未知錯誤'));
+      if (btn) { btn.disabled = false; btn.textContent = '⏻ 安全關機'; }
+    }
+  } catch (err) {
+    alert('關機請求失敗：' + err);
+    if (btn) { btn.disabled = false; btn.textContent = '⏻ 安全關機'; }
+  }
+}

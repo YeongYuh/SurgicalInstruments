@@ -393,6 +393,21 @@ body {
 }
 .btn-accent:hover { background: #2860c8; }
 
+.btn-danger {
+  background: #5a1a1a;
+  border: none;
+  border-radius: 5px;
+  color: #f87171;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.15s;
+  white-space: nowrap;
+}
+.btn-danger:hover { background: #7a2020; }
+.btn-danger:disabled { opacity: 0.5; cursor: not-allowed; }
+
 #btn-camera.active {
   border-color: #4caf50 !important;
   color: #4caf50;
@@ -481,6 +496,7 @@ body {
   .section-title { font-size: 12px; }
   .btn-ghost { padding: 3px 8px; font-size: 11px; }
   .btn-accent { padding: 3px 8px; font-size: 11px; }
+  .btn-danger { padding: 3px 8px; font-size: 11px; }
   .btn-ghost.small { padding: 2px 6px; font-size: 10px; }
 
   #results-table { font-size: 10.5px; }
