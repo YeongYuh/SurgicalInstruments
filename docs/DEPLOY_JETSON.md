@@ -11,7 +11,7 @@
 1. [系統概覽](#1-系統概覽)
 2. [硬體需求](#2-硬體需求)
 3. [OS 環境假設](#3-os-環境假設)
-4. [取得專案](#4-取得專案)
+4. [取得專案（從 GitHub 下載並安裝）](#4-取得專案)
 5. [安裝系統套件](#5-安裝系統套件)
 6. [建立或修復 Python venv](#6-建立或修復-python-venv)
 7. [Python 依賴說明](#7-python-依賴說明)
@@ -85,42 +85,236 @@ Flask 後端
 
 ## 4. 取得專案
 
-### 方法 A：從 GitHub 克隆（全新部署）
+本節說明如何在全新 Jetson Nano 上從 GitHub 下載並安裝本專案，以及如何使用已複製的目錄。
+
+---
+
+### 從 GitHub 下載並安裝
+
+#### 前提條件
+
+- Jetson 必須能連上網路（有線或 Wi-Fi）。
+- Git 必須已安裝：
+
+  ```bash
+  sudo apt update
+  sudo apt install -y git
+  ```
+
+- 確認 Git 版本：
+
+  ```bash
+  git --version
+  # 預期：git version 2.x.x
+  ```
+
+#### 選擇安裝目錄
+
+建議使用以下路徑：
 
 ```bash
-mkdir -p ~/projects
-cd ~/projects
+mkdir -p /home/camlion/projects
+cd /home/camlion/projects
+```
+
+> 若使用不同使用者名稱，請將 `camlion` 替換為實際使用者名稱。
+
+---
+
+#### 方法 A：HTTPS 克隆（推薦用於全新機器）
+
+HTTPS 克隆不需要設定 SSH 金鑰，適合快速取得專案。
+
+```bash
+git clone https://github.com/YeongYuh/SurgicalInstruments.git instrument
+cd instrument
+git checkout jetson-gpu-experiment
+```
+
+**關於認證**：
+
+- 若儲存庫為**公開（public）**，`git clone` 可直接執行，不需登入。
+- 若儲存庫為**私有（private）**，Git 會要求輸入使用者名稱與密碼。
+  > ⚠️ **注意**：GitHub 已停止接受帳號密碼進行 Git 操作。請改用 **Personal Access Token（個人存取令牌）** 作為密碼欄位的輸入。
+
+**取得 Personal Access Token**：
+
+1. 前往 GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)
+2. 點擊 **Generate new token**
+3. 設定 Scope：至少勾選 `repo`
+4. 複製產生的 token（只顯示一次）
+5. 在 `git clone` 提示輸入密碼時，貼上此 token
+
+---
+
+#### 方法 B：SSH 克隆
+
+SSH 克隆不需要每次輸入認證資訊，適合長期使用的機器。
+
+**步驟 1：確認 SSH 金鑰是否已設定**
+
+```bash
+ssh -T git@github.com
+```
+
+- 若顯示 `Hi <username>! You've successfully authenticated...`，代表已設定完成，跳至步驟 4。
+- 若顯示 `Permission denied (publickey)`，需先產生金鑰（步驟 2）。
+
+> 若首次連線 GitHub，會出現以下提示：
+> ```
+> The authenticity of host 'github.com' can't be established.
+> Are you sure you want to continue connecting (yes/no)?
+> ```
+> 輸入 `yes` 即可，GitHub 的主機金鑰會被加入 `~/.ssh/known_hosts`。
+
+**步驟 2：產生 SSH 金鑰**
+
+```bash
+ssh-keygen -t ed25519 -C "your_email@example.com"
+```
+
+- 按 Enter 接受預設路徑（`~/.ssh/id_ed25519`）
+- 可設定 passphrase 或直接 Enter 略過
+
+**步驟 3：將公開金鑰加入 GitHub**
+
+```bash
+cat ~/.ssh/id_ed25519.pub
+```
+
+複製輸出的完整內容，然後：
+
+1. 開啟瀏覽器，前往 `https://github.com/settings/keys`
+2. 點擊 **New SSH key**
+3. Title：填入識別名稱（例如 `Jetson Nano`）
+4. Key type：選擇 **Authentication Key**
+5. Key：貼上剛才複製的公開金鑰
+6. 點擊 **Add SSH key**
+
+**步驟 4：SSH 克隆**
+
+```bash
 git clone git@github.com:YeongYuh/SurgicalInstruments.git instrument
 cd instrument
 git checkout jetson-gpu-experiment
 ```
 
-> 若使用 HTTPS 克隆：
-> ```bash
-> git clone https://github.com/YeongYuh/SurgicalInstruments.git instrument
-> ```
+---
 
-確認狀態：
+#### 快速指令整合（HTTPS 路徑）
+
+以下為從零開始的完整命令序列：
+
+```bash
+sudo apt update
+sudo apt install -y git
+mkdir -p /home/camlion/projects
+cd /home/camlion/projects
+git clone https://github.com/YeongYuh/SurgicalInstruments.git instrument
+cd instrument
+git checkout jetson-gpu-experiment
+git status
+```
+
+---
+
+#### 確認儲存庫狀態
+
+克隆完成後，確認以下項目：
 
 ```bash
 git status
 git branch
 git log --oneline -5
+git remote -v
 ```
 
-預期輸出：
+**預期輸出**：
 
 ```
 On branch jetson-gpu-experiment
 Your branch is up to date with 'origin/jetson-gpu-experiment'.
-...
+nothing to commit, working tree clean
+
 * jetson-gpu-experiment
   master
+
+origin  https://github.com/YeongYuh/SurgicalInstruments.git (fetch)
+origin  https://github.com/YeongYuh/SurgicalInstruments.git (push)
 ```
+
+- Branch 應為 `jetson-gpu-experiment`
+- Remote 應指向 `YeongYuh/SurgicalInstruments`
+- 工作目錄應為乾淨（除非 `output/` 目錄的執行時期設定已被修改）
+
+---
+
+#### 克隆後確認模型檔案
+
+> ⚠️ **重要**：大型模型檔（`best.pt`、`best.onnx`）可能被 `.gitignore` 排除，不包含在 Git 儲存庫中。克隆後請立即確認：
+
+```bash
+ls -lh models/
+test -f models/best.pt          && echo "best.pt OK"          || echo "best.pt 缺失"
+test -f models/best.onnx        && echo "best.onnx OK"        || echo "best.onnx 缺失"
+test -f models/class_weight.json && echo "class_weight.json OK" || echo "class_weight.json 缺失"
+```
+
+| 檔案 | 若缺失的處理方式 |
+|------|-----------------|
+| `models/best.pt` | 從備份機器手動複製，或洽詢專案維護者 |
+| `models/best.onnx` | 若 `best.pt` 存在，可重新匯出（見第 8 節） |
+| `models/class_weight.json` | 應包含於 Git，若缺失請確認 branch 正確 |
+
+**請勿期望 GitHub 儲存庫一定包含大型二進位模型檔。**
+
+---
+
+#### 克隆後繼續設定
+
+取得專案後，繼續依序完成：
+
+1. [第 5 節](#5-安裝系統套件)：安裝系統套件（Python 3.8、libgl1 等）
+2. [第 6 節](#6-建立或修復-python-venv)：建立 Python 3.8 venv
+3. 安裝 Python 依賴：`pip install -r requirements.txt`
+4. [第 9 節](#9-攝影機設定)：設定攝影機權限
+5. [第 10 節](#10-電子秤串列埠設定)：設定電子秤串列埠權限
+6. [第 12 節](#12-啟動應用程式)：執行 `./run_jetson.sh`
+
+---
+
+#### GitHub 克隆常見問題
+
+**A. `Permission denied (publickey)`**
+
+- **原因**：Jetson 的 SSH 金鑰未加入 GitHub，或使用了錯誤的 clone URL。
+- **修復**：改用 HTTPS 克隆，或依照方法 B 設定 SSH 金鑰。
+
+**B. 輸入使用者名稱/密碼後被拒（`Authentication failed`）**
+
+- **原因**：GitHub 已停止接受帳號密碼進行 Git 操作（2021 年起）。
+- **修復**：在密碼欄位輸入 Personal Access Token，而非帳號密碼。
+
+**C. `repository not found`**
+
+- **原因**：URL 有誤，或私有儲存庫沒有存取權限。
+- **修復**：確認 URL 拼寫正確；若為私有儲存庫，確認帳號已被授予存取權，並使用正確的認證方式。
+
+**D. 首次連線出現主機金鑰確認提示**
+
+```
+The authenticity of host 'github.com' can't be established.
+ED25519 key fingerprint is SHA256:...
+Are you sure you want to continue connecting (yes/no/[fingerprint])?
+```
+
+- 輸入 `yes` 繼續，GitHub 的主機金鑰會被記錄至 `~/.ssh/known_hosts`，下次不再出現此提示。
+
+---
 
 ### 方法 B：使用已複製的目錄
 
-若專案目錄已透過 USB 隨身碟或 `rsync` 複製，進入目錄後確認 git 狀態：
+若專案目錄已透過 USB 隨身碟或 `rsync` 從其他機器複製，進入目錄後確認 git 狀態：
 
 ```bash
 cd /home/camlion/projects/instrument
@@ -130,6 +324,8 @@ git remote -v
 ```
 
 若顯示的 branch 正確，即可繼續。若有未預期的修改，請視情況決定是否還原。
+
+> 若 venv 也一併複製過來，請見第 6 節方法 B 的修復步驟（venv 路徑可能仍指向舊機器的使用者目錄）。
 
 ---
 
