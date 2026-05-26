@@ -12,3 +12,10 @@ numpy
 Pillow
 pyserial
 flask>=2.3
+cycler
+
+# requests sub-dependencies not auto-installed from the copied venv on this machine
+six
+urllib3
+certifi
+idna
