@@ -147,22 +147,31 @@ def test_camera_result_does_not_reinterpret_a_stale_result(api, monkeypatch):
 
 # ── 3. /bom_report must not mix A counts with B standards ───────────────────
 
-def test_bom_report_does_not_mix_packages(api):
+def test_bom_report_refuses_a_stale_result_instead_of_mixing_packages(api):
+    """Not merely "drop the stale counts" — refuse the report entirely.
+
+    A BOM listing every obstetric instrument as detected=0 is indistinguishable
+    from a tray that was actually scanned and found empty, and it would be
+    downloaded, filed, and believed.
+    """
     client, manager = api
     _produce_result(client)
 
-    before = client.get("/bom_report").data.decode("utf-8-sig")
-    assert "widget" in before
+    before = client.get("/bom_report")
+    assert before.status_code == 200
+    assert "widget" in before.data.decode("utf-8-sig")
 
     manager.activate("obgyn")
 
-    after = client.get("/bom_report").data.decode("utf-8-sig")
+    after = client.get("/bom_report")
+    payload = _json(after)
 
-    assert "婦產科" in after or "obgyn" in after
-    assert "forceps" in after
-    # ortho's detected quantity must not appear as an obstetric count.
-    rows = [line.split(",") for line in after.splitlines() if line.startswith("forceps")]
-    assert rows and rows[0][2] == "0", "stale ortho counts leaked into the BOM"
+    assert after.status_code == 409
+    assert payload["ok"] is False
+    assert payload["result_status"] == "stale"
+    assert payload["active_package"] == "obgyn"
+    # No fabricated obstetric report was produced at all.
+    assert "forceps" not in after.data.decode("utf-8")
 
 
 # ── 4 & 5. generation, not just the package id ──────────────────────────────

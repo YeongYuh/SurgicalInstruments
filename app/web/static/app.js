@@ -1362,8 +1362,37 @@ document.addEventListener('click', e => {
 });
 
 // ── Downloads ─────────────────────────────────────────────────────────────
+// History export: always available — it reads immutable records.
 function downloadReport() { window.location.href = '/report'; }
-function downloadBOM()    { window.location.href = '/bom_report'; }
+
+// BOM export: /bom_report returns 409 when there is no valid result for the
+// active package, so a plain navigation would dump a JSON error page onto a
+// kiosk with no back button.  Fetch first, then hand over a real file.
+async function downloadBOM() {
+  try {
+    const res = await fetch('/bom_report');
+    if (res.status === 409) {
+      const data = await res.json().catch(() => ({}));
+      alert('無法產生 BOM 報表：\n' + (data.error || '目前沒有有效的辨識結果'));
+      return;
+    }
+    if (!res.ok) {
+      alert('產生 BOM 報表失敗：' + await readError(res));
+      return;
+    }
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'bom_' + new Date().toISOString().replace(/[:.]/g, '-') + '.csv';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (e) {
+    alert('產生 BOM 報表失敗：' + e.message);
+  }
+}
 
 async function requestShutdown() {
   if (!confirm('確定要關機？\n系統將停止所有程式並安全關閉。')) return;

@@ -10,51 +10,7 @@ import pytest
 import app.web as web_pkg
 from app.scale_reader import MockScaleReader
 from app.web import history as hist
-from conftest import make_manager, write_package
-
-
-class FakeCamera:
-    """Just enough CameraThread surface for the switch route."""
-
-    def __init__(self, running: bool = True, recognizing: bool = False) -> None:
-        self._running = running
-        self._recognizing = recognizing
-        self.generation = 0
-        self.invalidated = 0
-        self.start_calls = 0
-        self.stop_calls = 0
-        self._lock = threading.Lock()
-
-    def is_running(self) -> bool:
-        return self._running
-
-    def stop_camera(self) -> None:
-        self._running = False
-        self._recognizing = False
-
-    def get_status(self) -> dict:
-        return {
-            "running": self._running,
-            "stopping": not self._running,
-            "recognition_running": self._recognizing,
-            "inference_running": False,
-            "recognition_generation": self.generation,
-            "session_id": 1,
-        }
-
-    def start_recognition(self) -> None:
-        self.start_calls += 1
-        self.generation += 1
-        self._recognizing = True
-
-    def stop_recognition(self) -> None:
-        self.stop_calls += 1
-        self.generation += 1
-        self._recognizing = False
-
-    def invalidate_results(self) -> None:
-        self.invalidated += 1
-        self.generation += 1
+from conftest import FakeCamera, make_manager, write_package
 
 
 @pytest.fixture

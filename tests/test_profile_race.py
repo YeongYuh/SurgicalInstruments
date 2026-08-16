@@ -318,3 +318,52 @@ def test_standard_for_a_class_the_model_cannot_detect_is_rejected(tmp_path, monk
 
         # The same class at zero is fine.
         assert client.post("/standards", json={"ghost": 0}).status_code == 200
+
+
+# ── SI-PLATFORM-004: 17-19. the HTTP API takes JSON numbers, not strings ────
+
+@pytest.mark.parametrize("body", ['{"widget": "2"}', '{"widget": "1.5"}', '{"widget": " 3 "}'])
+def test_standards_rejects_numeric_strings(api, body):
+    """The UI sends JSON numbers; a string means the caller is not the UI.
+
+    Accepting "2" would make the HTTP API quietly more permissive than the
+    manifest validator it is meant to mirror.
+    """
+    client, _ = api
+    before = _json(client.get("/standards"))
+
+    response = client.post("/standards", data=body, content_type="application/json")
+
+    assert response.status_code == 400
+    assert "not a string" in _json(response)["error"]
+    assert _json(client.get("/standards")) == before
+
+
+@pytest.mark.parametrize("body", ['{"widget": "2.5"}', '{"widget": "0"}'])
+def test_unit_weights_rejects_numeric_strings(api, body):
+    client, _ = api
+    before = _json(client.get("/unit_weights"))
+
+    response = client.post("/unit_weights", data=body, content_type="application/json")
+
+    assert response.status_code == 400
+    assert "not a string" in _json(response)["error"]
+    assert _json(client.get("/unit_weights")) == before
+
+
+def test_json_numbers_are_still_accepted(api):
+    client, _ = api
+    assert client.post("/standards", json={"widget": 4}).status_code == 200
+    assert _json(client.get("/standards")) == {"widget": 4}
+    assert client.post("/unit_weights", json={"widget": 12.5}).status_code == 200
+    assert _json(client.get("/unit_weights"))["widget"] == 12.5
+
+
+def test_the_disk_loader_still_accepts_a_quoted_number(api):
+    """Older hand-edited profiles may quote their numbers; do not lose them."""
+    from app.validation import clean_loaded_quantity, clean_loaded_weight
+
+    assert clean_loaded_quantity("widget", "2") == (True, 2)
+    assert clean_loaded_weight("widget", "2.5") == (True, 2.5)
+    # ...but a quoted fraction is still not a whole number of instruments.
+    assert clean_loaded_quantity("widget", "1.7")[0] is False

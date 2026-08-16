@@ -430,6 +430,17 @@ finds a result from a superseded activation reports `result_stale: true` and
 serves no counts, so no API can combine one package's detections with another's
 standards.
 
+`has_result` separates "nothing has been recognised yet" (`result_status:
+"no_result"`) from "the model looked and found nothing" — the second is a real
+inventory with legitimately empty counts. `/bom_report` returns **409** for the
+first and a normal report for the second, so a tray that was never scanned can
+never produce a file that reads as every instrument missing.
+
+If a model cannot be *released* — teardown raised — the manager refuses to load
+anything else (`recovery_required: true`, HTTP 503) rather than risk two models
+in 4 GB. That state needs a service restart; it is the one failure the platform
+cannot recover from in-process.
+
 Profile edits carry the package they were made against (`X-Model-Package`), so a
 debounced standards edit that arrives after a switch is refused with **409**
 rather than written onto the wrong department's tray.

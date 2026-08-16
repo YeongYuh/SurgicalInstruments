@@ -79,6 +79,7 @@ from app.inference import (
     ModelBusyError,
     ModelManagerError,
     ModelNotReadyError,
+    ModelTeardownError,
     PackageMismatchError,
     ProfileValidationError,
     available_adapters,
@@ -398,12 +399,15 @@ def camera_result():
     result["ok"] = True
     sample = _current_sample()
     result["weight_sample"] = sample.to_dict()
-    if result.get("result_stale"):
-        result["weight_verification"] = None
-    else:
+    # Only verify a weight against an inventory that actually happened.
+    # "No recognition yet" and "recognised, found nothing" are different states
+    # and must not both render as an empty result with a verdict attached.
+    if result.get("has_result"):
         result["weight_verification"] = compute_weight_verification(
             model_state.standards, model_state.class_weights,
             sample, config.WEIGHT_TOLERANCE)
+    else:
+        result["weight_verification"] = None
     result["active_package"] = model_state.package_id or None
     result["model_generation"] = model_state.generation
     return jsonify(result)
@@ -695,6 +699,9 @@ def status():
         # healthy model back in service, even though the switch itself failed.
         "model_error": manager.model_error,
         "last_switch_error": manager.last_switch_error,
+        # True once a model could not be released: nothing more will load until
+        # the service restarts.
+        "recovery_required": manager.recovery_required,
     })
     return jsonify(payload)
 
@@ -785,6 +792,24 @@ def api_model_package_post():
 
     try:
         manager.activate(package_id)
+    except ModelTeardownError as exc:
+        # Residency is unknown; loading anything else could put two models in
+        # memory.  This is not retryable — only a restart clears it.
+        logger.critical("[model-switch] refused — %s", exc)
+        _, final_camera_running, final_recognizing = _camera_snapshot()
+        return jsonify(
+            ok=False,
+            error=str(exc),
+            active=manager.state().package_id or None,
+            model_ready=False,
+            model_error=manager.model_error,
+            last_switch_error=manager.last_switch_error,
+            recovery_required=True,
+            camera_running=final_camera_running,
+            recognition_running=final_recognizing,
+            recognition_was_running=was_recognizing,
+            recognition_resumed=False,
+        ), 503
     except (ModelManagerError, ModelBusyError) as exc:
         logger.error("[model-switch] failed: %s", exc)
         # activate() has already rolled the previous model back into service.
@@ -801,6 +826,7 @@ def api_model_package_post():
             model_ready=state.ready,
             model_error=manager.model_error,
             last_switch_error=manager.last_switch_error,
+            recovery_required=manager.recovery_required,
             fatal_error=manager.model_error,
             camera_running=final_camera_running,
             recognition_running=final_recognizing,
@@ -859,6 +885,22 @@ def bom_report():
     # package's standards would be a fabricated discrepancy report, so stale
     # counts are dropped rather than reinterpreted.
     state = sanitize_runtime_result(raw_state, model_state)
+
+    if not state.get("has_result"):
+        # Refuse rather than emit a report in which every expected instrument
+        # reads detected=0.  That file is indistinguishable from a tray that was
+        # scanned and found empty, and it would be downloaded, filed, and
+        # believed.  A zero-detection result that really happened is fine and
+        # still produces a BOM — see has_result.
+        reason = ("目前器械套件尚無有效辨識結果，請先執行辨識"
+                  if state.get("result_status") != "stale"
+                  else "上次辨識結果屬於其他器械套件，請重新執行辨識")
+        return jsonify(
+            ok=False,
+            error=reason,
+            result_status=state.get("result_status"),
+            active_package=model_state.package_id or None,
+        ), 409
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     csv_str = rpt.generate_bom_csv(

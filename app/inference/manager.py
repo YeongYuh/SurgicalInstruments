@@ -99,6 +99,20 @@ class ProfileValidationError(ModelManagerError):
         super().__init__(message)
 
 
+class ModelTeardownError(ModelManagerError):
+    """A model could not be released, so residency can no longer be proven.
+
+    Once this happens the manager refuses every further load.  There is no way
+    to tell from inside the process whether the runtime actually freed the
+    weights, and loading anything else would be gambling the 4 GB the whole
+    unit runs on.  Only a process restart re-establishes a trustworthy state.
+    """
+
+    def __init__(self, message: str, *, recovery_required: bool = True) -> None:
+        self.recovery_required = recovery_required
+        super().__init__(message)
+
+
 def _usable_weight(value: Any) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
@@ -273,6 +287,10 @@ class ModelManager:
         # the current model's error would read as a broken system.
         self._model_error: Optional[str] = None
         self._last_switch_error: Optional[str] = None
+        # Set when a model could not be released.  Latches for the lifetime of
+        # the process: residency is unknowable from here on, so no further load
+        # may be attempted.
+        self._teardown_unsafe = False
         self._loading = False
         self._compatibility: Dict[str, Any] = {}
         # Called inside the lifecycle gate right after a successful publish, so
@@ -356,6 +374,38 @@ class ModelManager:
         """Why the most recent switch ATTEMPT failed — survives a rollback."""
         with self._state_lock:
             return self._last_switch_error
+
+    @property
+    def recovery_required(self) -> bool:
+        """True once a model could not be released — needs a process restart."""
+        with self._state_lock:
+            return self._teardown_unsafe
+
+    def _assert_can_load(self) -> None:
+        if self.recovery_required:
+            raise ModelTeardownError(
+                "a previous model could not be released, so it may still be "
+                "resident — refusing to load another model. Restart the "
+                "instrument service to recover. (%s)" % (self.model_error or ""))
+
+    def _enter_unsafe_teardown(self, switch_error: str, cleanup_error: str) -> None:
+        """Latch the manager into "residency unknown" and stop loading models.
+
+        Reached when a target model loaded, then failed validation, and then
+        could not be torn down.  Reloading the previous model now could put two
+        models in memory at once — the one thing a 4 GB board cannot survive —
+        so the rollback is deliberately NOT attempted.
+        """
+        message = ("failed target model could not be released safely: %s — "
+                   "model residency is unknown; restart the service"
+                   % cleanup_error)
+        with self._state_lock:
+            self._teardown_unsafe = True
+            self._model_error = message
+            self._last_switch_error = "%s | cleanup: %s" % (switch_error, cleanup_error)
+            self._last_error = message
+        self._ready_event.clear()
+        logger.critical("[models] %s", message)
 
     def add_switch_listener(self, listener: Callable[["ActiveState"], None]) -> None:
         """Register a callback run inside the gate on every successful switch."""
@@ -535,31 +585,50 @@ class ModelManager:
         return generation
 
     def _restore(self, package: Optional[ModelPackage], profile: Optional[PackageProfile],
-                 adapter: Optional[ModelAdapter]) -> None:
+                 adapter: Optional[ModelAdapter],
+                 compatibility: Optional[Dict[str, Any]] = None) -> None:
         """Bring the previous package back into service after a failed switch.
 
-        Called with the lifecycle gate held.  If the old model refuses to load
-        again the manager goes into an explicit unusable state rather than
-        reporting an operational system that cannot actually run.
+        Called with the lifecycle gate held, and only once the failed target has
+        been provably released.
+
+        Rollback is held to the same bar as an activation: load AND warmup must
+        both succeed.  A model that reloads but cannot run is not "back in
+        service", and saying it is would hand the operator a system that fails
+        at the next inventory instead of now.
         """
         if adapter is None or package is None:
             return
         try:
             adapter.load()
-            adapter.warmup()      # lenient: the model already loaded once
+            adapter.warmup(strict=True)
+            restored_compatibility = compatibility
+            if profile is not None:
+                try:
+                    restored_compatibility = self._build_compatibility(profile, adapter)
+                except Exception:  # noqa: BLE001 - fall back to the saved snapshot
+                    pass
             with self._state_lock:
                 self._package = package
                 self._profile = profile
                 self._adapter = adapter
+                # Diagnostics must describe the model that is actually active;
+                # leaving the failed target's compatibility behind would make
+                # /api/model-package describe a package that never loaded.
+                self._compatibility = dict(restored_compatibility or {})
                 # The failed target's error belongs to the switch, not to this
                 # model — it is healthy again and must not look broken.
                 self._model_error = None
             self._ready_event.set()
             logger.info("[models] rolled back to package '%s'", package.id)
         except Exception as exc:  # noqa: BLE001
-            message = ("rollback failed: package '%s' could not be reloaded: %s"
+            message = ("rollback failed: package '%s' could not be restored: %s"
                        % (package.id, exc))
             with self._state_lock:
+                self._package = package
+                self._profile = profile
+                self._adapter = adapter
+                self._compatibility = dict(compatibility or {})
                 self._model_error = message
                 self._last_error = message
             self._ready_event.clear()
@@ -593,9 +662,11 @@ class ModelManager:
                         package.id, package.adapter)
 
             with self._gate(timeout, what="package switch"):
+                self._assert_can_load()
                 old_adapter = self._adapter
                 old_package = self._package
                 old_profile = self._profile
+                old_compatibility = self.compatibility   # restored on rollback
                 with self._state_lock:
                     self._loading = True
                 self._ready_event.clear()
@@ -633,11 +704,24 @@ class ModelManager:
                 except Exception as exc:  # noqa: BLE001 - any failure rolls back
                     message = ("failed to activate package '%s' (%s): %s"
                                % (package.id, package.adapter, exc))
+                    # The target may already be resident (load succeeded, then
+                    # warmup or compatibility failed).  Release it STRICTLY
+                    # before even considering a rollback: if teardown fails the
+                    # weights may still be held, and reloading the previous
+                    # model on top of them is exactly the double-residency this
+                    # whole design exists to prevent.
                     try:
-                        new_adapter.retire()
-                    except Exception:  # noqa: BLE001 - best-effort cleanup
-                        pass
-                    self._restore(old_package, old_profile, old_adapter)
+                        new_adapter.retire(strict=True)
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        with self._state_lock:
+                            self._loading = False
+                        self._enter_unsafe_teardown(message, str(cleanup_exc))
+                        raise ModelTeardownError(
+                            "%s; and the target model could not be released: %s"
+                            % (message, cleanup_exc))
+
+                    self._restore(old_package, old_profile, old_adapter,
+                                  old_compatibility)
                     with self._state_lock:
                         self._last_error = message
                         self._last_switch_error = message
@@ -677,6 +761,7 @@ class ModelManager:
         """
         with self._switch_lock:
             try:
+                self._assert_can_load()
                 package = self._resolve_for_activation(package_id)
                 adapter_cls = get_adapter_class(package.adapter)
                 profile = self._load_profile_for(package)
@@ -867,6 +952,7 @@ class ModelManager:
                 "error": self.last_error,
                 "model_error": self.model_error,
                 "last_switch_error": self.last_switch_error,
+                "recovery_required": self.recovery_required,
                 "fatal_error": self.model_error,   # legacy alias
                 "packages_dir": str(self.packages_dir),
             }
@@ -887,6 +973,11 @@ class ModelManager:
             # Whether THIS model is unusable, versus why the last switch failed.
             "model_error": self.model_error,
             "last_switch_error": self.last_switch_error,
+            # True once residency became unknowable — no further model may load
+            # until the service is restarted.
+            "recovery_required": self.recovery_required,
+            "teardown_error": (adapter.teardown_error if adapter is not None else None),
+            "resource_state": (adapter.resource_state if adapter is not None else "unknown"),
             "fatal_error": self.model_error,   # legacy alias
         })
         return payload

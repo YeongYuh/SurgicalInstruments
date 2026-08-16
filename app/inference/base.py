@@ -26,7 +26,7 @@ import logging
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from app.inference.types import InferenceResult, ModelInfo
 
@@ -72,6 +72,7 @@ class ModelAdapter(ABC):
         self._closing = False
         self._retired = False
         self._warmup_error: Optional[str] = None
+        self._teardown_error: Optional[str] = None
         self._inference_count = 0
 
     # ── subclass hooks ────────────────────────────────────────────────────
@@ -117,6 +118,24 @@ class ModelAdapter(ABC):
     @property
     def warmup_error(self) -> Optional[str]:
         return self._warmup_error
+
+    @property
+    def teardown_error(self) -> Optional[str]:
+        """Set when a lenient unload swallowed a teardown failure."""
+        return self._teardown_error
+
+    @property
+    def resource_state(self) -> str:
+        """What we can actually claim about the runtime's memory.
+
+        ``released`` is only reported when teardown returned cleanly.  A lenient
+        unload that swallowed an error leaves ``unknown``: the adapter will not
+        be used again, but nothing here may be read as proof that the weights
+        were freed.
+        """
+        if self._teardown_error:
+            return "unknown"
+        return "held" if self._loaded else "released"
 
     @property
     def inference_count(self) -> int:
@@ -230,9 +249,17 @@ class ModelAdapter(ABC):
                             self.name, self.package.id, exc)
                         raise AdapterError(
                             "unload failed for package '%s': %s" % (self.package.id, exc))
-                    logger.warning("[adapter:%s] unload error (ignored): %s", self.name, exc)
+                    # Lenient teardown gives up on the adapter, but it must not
+                    # be read as proof the runtime freed anything.
+                    self._teardown_error = str(exc)
+                    logger.warning(
+                        "[adapter:%s] unload error (lenient, resource state unknown): %s",
+                        self.name, exc)
+                else:
+                    self._teardown_error = None
                 self._loaded = False
-                logger.info("[adapter:%s] unloaded package=%s", self.name, self.package.id)
+                logger.info("[adapter:%s] unloaded package=%s  resources=%s",
+                            self.name, self.package.id, self.resource_state)
         finally:
             self._closing = False
 
@@ -260,6 +287,10 @@ class ModelAdapter(ABC):
         if self._closing:
             return "unloading"
         return "loaded" if self._loaded else "idle"
+
+    def _describe_teardown(self) -> Dict[str, Any]:
+        return {"teardown_error": self._teardown_error,
+                "resource_state": self.resource_state}
 
     # alias — some callers think in terms of file handles
     close = unload

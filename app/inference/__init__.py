@@ -40,6 +40,7 @@ from app.inference.manager import (  # noqa: F401
     ModelManager,
     ModelManagerError,
     ModelNotReadyError,
+    ModelTeardownError,
     PackageMismatchError,
     ProfileValidationError,
 )

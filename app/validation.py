@@ -25,13 +25,24 @@ class ValueValidationError(ValueError):
         super().__init__("invalid value for '%s': %r — %s" % (field, value, reason))
 
 
-def _as_number(field: str, value: Any) -> float:
+def _as_number(field: str, value: Any, *, allow_strings: bool = False) -> float:
+    """Coerce to float under strict rules.
+
+    ``allow_strings`` is False for anything arriving over HTTP.  The UI sends
+    JSON numbers, so a string means the caller is not what we think it is —
+    accepting ``"2"`` here would make the API quietly more permissive than the
+    manifest validator it is supposed to mirror.  Only the on-disk profile
+    loader, which may meet older hand-edited files, opts in.
+    """
     # bool is an int subclass; True would otherwise silently become 1.
     if isinstance(value, bool):
         raise ValueValidationError(field, value, "must be a number, not a boolean")
     if isinstance(value, (int, float)):
         number = float(value)
     elif isinstance(value, str):
+        if not allow_strings:
+            raise ValueValidationError(
+                field, value, "must be a JSON number, not a string")
         text = value.strip()
         if not text:
             raise ValueValidationError(field, value, "must not be empty")
@@ -46,9 +57,10 @@ def _as_number(field: str, value: Any) -> float:
     return number
 
 
-def parse_standard_quantity(field: str, value: Any) -> int:
+def parse_standard_quantity(field: str, value: Any, *,
+                            allow_strings: bool = False) -> int:
     """Expected quantity: a whole, non-negative count."""
-    number = _as_number(field, value)
+    number = _as_number(field, value, allow_strings=allow_strings)
     if number < 0:
         raise ValueValidationError(field, value, "must not be negative")
     if number != int(number):
@@ -56,9 +68,10 @@ def parse_standard_quantity(field: str, value: Any) -> int:
     return int(number)
 
 
-def parse_unit_weight(field: str, value: Any) -> float:
+def parse_unit_weight(field: str, value: Any, *,
+                      allow_strings: bool = False) -> float:
     """Grams per instrument: non-negative and finite."""
-    number = _as_number(field, value)
+    number = _as_number(field, value, allow_strings=allow_strings)
     if number < 0:
         raise ValueValidationError(field, value, "must not be negative")
     return number
@@ -77,10 +90,12 @@ def _parse_map(values: Mapping[str, Any], parser) -> Dict[str, Any]:
 
 
 def parse_standards_map(values: Mapping[str, Any]) -> Dict[str, int]:
+    """Strict parser for the HTTP API — JSON numbers only."""
     return _parse_map(values, parse_standard_quantity)
 
 
 def parse_unit_weights_map(values: Mapping[str, Any]) -> Dict[str, float]:
+    """Strict parser for the HTTP API — JSON numbers only."""
     return _parse_map(values, parse_unit_weight)
 
 
@@ -97,15 +112,19 @@ def clean_loaded_quantity(field: str, value: Any) -> Tuple[bool, int]:
     Returns ``(ok, quantity)``.  Bad values are dropped by the caller with a
     warning rather than rounded — a legacy 1.7 is corrupt data, and turning it
     into 1 would invent an expectation nobody set.
+
+    Numeric strings ARE accepted here (unlike over HTTP): an older hand-edited
+    profile may contain them, and dropping otherwise-valid site configuration
+    over a quoting style would be the worse failure.
     """
     try:
-        return True, parse_standard_quantity(field, value)
+        return True, parse_standard_quantity(field, value, allow_strings=True)
     except ValueValidationError:
         return False, 0
 
 
 def clean_loaded_weight(field: str, value: Any) -> Tuple[bool, float]:
     try:
-        return True, parse_unit_weight(field, value)
+        return True, parse_unit_weight(field, value, allow_strings=True)
     except ValueValidationError:
         return False, 0.0

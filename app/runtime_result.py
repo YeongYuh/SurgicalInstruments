@@ -37,32 +37,65 @@ def result_matches_active(package_id: Optional[str],
     return int(model_generation) == int(active_state.generation)
 
 
+#: No inference has been published for the active package yet.
+STATUS_NO_RESULT = "no_result"
+#: A published result that belongs to the active activation.
+STATUS_CURRENT = "current"
+#: A published result from a package/activation that has been replaced.
+STATUS_STALE = "stale"
+
+
 def is_empty_result(result: Mapping[str, Any]) -> bool:
-    """A result that has not been produced yet is neither current nor stale."""
-    return not result.get("timestamp") and not result.get("counts")
+    """Has anything been published at all?
+
+    Keyed on the timestamp, which is written only when an inference actually
+    commits — NOT on the counts.  "The model looked and found nothing" is a
+    real, valid inventory result whose counts are legitimately empty, and
+    confusing it with "nothing has run yet" is what makes a blank BOM read as a
+    tray with every instrument missing.
+    """
+    return not result.get("timestamp")
+
+
+def has_current_result(result: Mapping[str, Any], active_state) -> bool:
+    """True only for a published result belonging to the active activation."""
+    if is_empty_result(result):
+        return False
+    return result_matches_active(result.get("package_id"),
+                                 result.get("model_generation"), active_state)
 
 
 def sanitize_runtime_result(result: Mapping[str, Any], active_state) -> Dict[str, Any]:
     """Return the result with model-dependent fields cleared if it is stale.
 
-    Diagnostic fields (``result_stale`` and the result's own package identity)
-    are kept so the UI and logs can explain *why* the panel went blank, rather
-    than silently showing nothing.
+    Adds three flags every consumer needs:
+
+    ``has_result``      an inference for the active package has been published
+    ``result_status``   no_result / current / stale
+    ``result_stale``    the result exists but belongs to a superseded package
+
+    Diagnostic fields (the result's own package identity) are kept so the UI and
+    logs can explain *why* a panel went blank rather than silently showing
+    nothing.
     """
     payload: Dict[str, Any] = dict(result)
     package_id = payload.get("package_id")
     generation = payload.get("model_generation")
+    payload["result_package_id"] = package_id
+    payload["result_model_generation"] = generation
 
     if is_empty_result(payload):
         payload["result_stale"] = False
-        payload["result_package_id"] = package_id
-        payload["result_model_generation"] = generation
+        payload["has_result"] = False
+        payload["result_status"] = STATUS_NO_RESULT
+        payload["counts"] = {}
+        payload["weight_verification"] = None
         return payload
 
     current = result_matches_active(package_id, generation, active_state)
     payload["result_stale"] = not current
-    payload["result_package_id"] = package_id
-    payload["result_model_generation"] = generation
+    payload["has_result"] = current
+    payload["result_status"] = STATUS_CURRENT if current else STATUS_STALE
 
     if not current:
         payload["counts"] = {}
