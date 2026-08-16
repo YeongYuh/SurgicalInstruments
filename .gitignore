@@ -9,11 +9,22 @@ __pycache__/
 # Environment (keep .env.example, ignore actual .env)
 .env
 
-# ML models — large binaries, place manually
+# ML models — large binaries, place manually.
+# Patterned on any depth: a package's model usually lives in models/<id>/,
+# and `models/*.onnx` would not match it, so dropping a 40 MB binary into
+# models/demo/ used to stage it for commit by accident.
+models/**/*.pt
+models/**/*.pth
+models/**/*.engine
+models/**/*.onnx
+models/**/*.tflite
+models/**/*.torchscript
 models/*.pt
+models/*.pth
 models/*.engine
 models/*.onnx
 models/*.tflite
+models/*.torchscript
 
 # Input images — place manually
 input/

@@ -7,10 +7,14 @@
 
 | 項目 | 放置路徑 | 說明 |
 |---|---|---|
-| 模型檔 | `models/demo/model.onnx` | 或改 manifest 的 `model_file` 指到你的實際路徑 |
+| 模型檔 | `models/demo/model.onnx` | 目錄已建好，且該目錄下的模型檔已被 `.gitignore` 忽略，不會誤 commit |
 | 備援模型檔 | `models/demo/model.pt` | 選用；主檔不存在時才使用 |
 | 每類單重 | `model_packages/demo/class_weight.json` | `{"類別名稱": 公克數, ...}`，類別名稱必須與模型輸出一致 |
 | 標準數量 | `model_packages/demo/standards.json` | `{"類別名稱": 應有數量, ...}`，出廠預設值 |
+
+> 只有模型、還沒有重量與標準數量時：可先讓 `standards.json` 全部填 0，
+> `class_weight.json` 只填真正有資料的類別。辨識與盤點可以先跑，重量驗證會顯示
+> 「尚未設定標準重量」而不是假的 PASS/FAIL。**不要為了讓它變綠色而編數字。**
 
 manifest 需要確認的欄位：
 
