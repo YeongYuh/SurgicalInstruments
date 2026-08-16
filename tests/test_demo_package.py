@@ -1,16 +1,12 @@
-"""Demo model package: the shipped template, and the integration path it feeds.
+"""Demo model package configuration and the integration path around it.
 
-The demo model binary is not present on this machine, so nothing here loads a
-real demo model.  What IS tested is everything that must already be correct for
-the drop-in to work the moment the binary arrives:
+These tests never load the demo graph itself (see test_yolov9_adapter.py for
+that) — they check the package wiring: the manifest is structurally sound and
+names a registered adapter, filling in a package makes it activatable, and
+switching ortho -> demo -> ortho keeps the two packages' data apart.
 
-* the shipped template is structurally sound and declares a registered adapter
-* filling it in produces a valid, activatable package
-* switching ortho -> demo -> ortho keeps the two packages' data apart
-* a demo inventory is recorded and reported as a demo inventory
-
-The adapter name is deliberately NOT asserted to be "ultralytics": that field in
-the template is a placeholder, and the real demo model decides it.
+The adapter name is deliberately not hard-coded here: the model decides it, and
+pinning a guess in a test is how a wrong adapter survives review.
 """
 
 from __future__ import annotations
@@ -36,7 +32,7 @@ def _raw_demo_manifest():
     return json.loads(DEMO_MANIFEST.read_text(encoding="utf-8"))
 
 
-# ── 1-4. the shipped template ───────────────────────────────────────────────
+# ── the shipped demo package ────────────────────────────────────────────────
 
 def test_demo_manifest_exists_and_parses():
     assert DEMO_MANIFEST.exists(), "the demo package template is missing"
@@ -52,16 +48,22 @@ def test_demo_manifest_loads_as_a_package():
     assert pkg.display_name
 
 
-def test_demo_is_still_a_template_until_real_data_arrives():
-    """It must stay a template while the model and its data are absent.
+def test_demo_is_a_configured_package_now_that_the_model_exists():
+    """The real model arrived, so template=false is now correct.
 
-    Flipping template=false without the real files would put a package in the
-    operator's dropdown that cannot possibly work.
+    Until it did, the package deliberately stayed a template: an entry in the
+    operator's dropdown that cannot possibly work is worse than one that is
+    visibly not ready.
     """
     pkg = load_manifest(DEMO_MANIFEST, project_root=config.PROJECT_ROOT,
                         expected_id="demo")
-    assert pkg.is_template is True
-    assert pkg.model_available() is False
+    assert pkg.is_template is False
+    assert pkg.load_class_weights()
+    assert pkg.has_presets
+    # The model binary is git-ignored, so it may legitimately be absent on a
+    # fresh clone; the manifest must still point somewhere sensible.
+    assert pkg.model_file is not None
+    assert pkg.model_file.name.endswith(".onnx")
 
 
 def test_demo_declares_a_registered_adapter():
@@ -92,14 +94,16 @@ def test_demo_drop_in_directory_exists():
     assert drop_in.is_dir(), "models/demo/ should exist as the drop-in location"
 
 
-def test_demo_is_listed_but_not_activatable_yet():
+def test_demo_is_listed_and_activatable_when_its_graph_is_present():
     packages = discover_packages(Path(config.MODEL_PACKAGES_DIR),
                                  project_root=config.PROJECT_ROOT)
     assert "demo" in packages, "the demo package must be visible to the operator"
     entry = packages["demo"].to_dict()
-    assert entry["valid"] is True          # the manifest itself is fine
-    assert entry["template"] is True
-    assert entry["activatable"] is False   # ...but it cannot be selected yet
+    assert entry["valid"] is True
+    assert entry["template"] is False
+    assert entry["adapter"] == "yolov9_seg_onnx"
+    # activatable tracks the binary, which is git-ignored and so may be absent.
+    assert entry["activatable"] is entry["model_available"]
 
 
 # ── 5-8. what happens once the real data is dropped in ──────────────────────

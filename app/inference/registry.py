@@ -139,11 +139,19 @@ def _load_ultralytics_adapter() -> Type[ModelAdapter]:
     return UltralyticsAdapter
 
 
+def _load_yolov9_seg_onnx_adapter() -> Type[ModelAdapter]:
+    from app.inference.adapters.yolov9_seg_onnx import Yolov9SegOnnxAdapter
+
+    return Yolov9SegOnnxAdapter
+
+
 def register_builtin_adapters() -> None:
     """Register the adapters shipped with the platform.  Idempotent."""
     with _lock:
         if "ultralytics" not in _registry:
             _registry["ultralytics"] = _AdapterSpec(_load_ultralytics_adapter, True)
+        if "yolov9_seg_onnx" not in _registry:
+            _registry["yolov9_seg_onnx"] = _AdapterSpec(_load_yolov9_seg_onnx_adapter, True)
 
 
 register_builtin_adapters()
