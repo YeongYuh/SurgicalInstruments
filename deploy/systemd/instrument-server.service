@@ -1,0 +1,19 @@
+[Unit]
+Description=Instrument Recognition Flask Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=camlion
+Group=camlion
+WorkingDirectory=/home/camlion/projects/instrument
+Environment=ENABLE_SYSTEM_SHUTDOWN=true
+ExecStart=/home/camlion/projects/instrument/scripts/start_instrument_server.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

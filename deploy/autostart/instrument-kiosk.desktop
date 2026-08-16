@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Instrument Kiosk
+Comment=Launch Instrument Recognition Kiosk
+Exec=/home/camlion/projects/instrument/scripts/start_kiosk.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true
