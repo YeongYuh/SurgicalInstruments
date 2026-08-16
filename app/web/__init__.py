@@ -13,12 +13,12 @@ import atexit
 import logging
 import threading
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Optional
 
 from flask import Flask
 
 import app.config as config
-from app.inference import ModelManager, ModelManagerError
+from app.inference import ModelManager, ModelManagerError, PackageMismatchError
 from app.scale_reader import create_scale_reader
 from app.weight_verification import compute_weight_verification  # re-exported
 
@@ -143,26 +143,22 @@ def get_class_weights() -> Dict[str, float]:
     return profile.class_weights if profile is not None else {}
 
 
-def update_standards(values: Dict[str, Any]) -> Dict[str, int]:
-    profile = model_manager.active_profile
-    if profile is None:
-        raise ModelManagerError("no active model package — cannot edit standards")
-    return profile.update_standards(values)
+def update_standards(values: Dict[str, Any],
+                     package_id: Optional[str] = None) -> Dict[str, int]:
+    """Edit standards, refusing the write if the caller meant another package."""
+    return model_manager.update_active_profile("standards", values, package_id=package_id)
 
 
-def update_unit_weights(values: Dict[str, Any]) -> Dict[str, float]:
-    profile = model_manager.active_profile
-    if profile is None:
-        raise ModelManagerError("no active model package — cannot edit unit weights")
-    return profile.update_unit_weights(values)
+def update_unit_weights(values: Dict[str, Any],
+                        package_id: Optional[str] = None) -> Dict[str, float]:
+    return model_manager.update_active_profile("unit_weights", values, package_id=package_id)
 
 
-def register_classes(class_names: Iterable[str]) -> bool:
-    """Register model output classes the operator has not configured yet."""
-    profile = model_manager.active_profile
-    if profile is None:
-        return False
-    return profile.register_classes(class_names)
+# NOTE: there is deliberately no module-level register_classes().  Registering a
+# model's output classes must target the package that produced them, which is
+# only knowable from the inference session that ran — asking "which profile is
+# active now?" after inference is exactly how one package's classes end up in
+# another's profile.  Use InferenceSession.register_classes().
 
 
 def package_identity() -> Dict[str, Optional[str]]:

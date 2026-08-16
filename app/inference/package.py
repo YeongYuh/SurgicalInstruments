@@ -17,11 +17,16 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from app.inference.registry import available_adapters, has_adapter
+from app.inference.registry import (
+    adapter_requires_model_file,
+    available_adapters,
+    has_adapter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +129,29 @@ class ModelPackage:
 
     # ── inventory data ────────────────────────────────────────────────────
 
+    @property
+    def requires_model_file(self) -> bool:
+        return adapter_requires_model_file(self.adapter)
+
+    def model_available(self) -> bool:
+        """Is there actually a model on disk to load?
+
+        A manifest can be perfectly valid while its model binary is absent —
+        the two are different failures and are reported separately, so the
+        operator is not offered a package that is guaranteed to fail on click.
+        """
+        if not self.requires_model_file:
+            return True
+        return self.model_file_exists() or self.fallback_exists()
+
+    def model_error(self) -> Optional[str]:
+        if self.is_template or self.model_available():
+            return None
+        parts = [str(self.model_file)] if self.model_file else []
+        if self.fallback_model_file:
+            parts.append(str(self.fallback_model_file))
+        return "model file not found: %s" % (" / ".join(parts) or "(none declared)")
+
     def load_class_weights(self) -> Dict[str, float]:
         """grams per single instrument, keyed by class name (read-only)."""
         if self.class_weights_path is None:
@@ -134,7 +162,8 @@ class ModelPackage:
         """Factory-default expected quantities, keyed by class name."""
         if self.default_standards_path is None:
             return {}
-        raw = _load_number_map(self.default_standards_path, "default_standards", cast=float)
+        raw = _load_number_map(self.default_standards_path, "default_standards",
+                               cast=float, require_int=True)
         return {k: int(v) for k, v in raw.items()}
 
     def load_default_unit_weights(self) -> Dict[str, float]:
@@ -156,6 +185,8 @@ class ModelPackage:
             "model_file_exists": self.model_file_exists(),
             "fallback_model_file": (str(self.fallback_model_file)
                                     if self.fallback_model_file else ""),
+            "model_available": self.model_available(),
+            "requires_model_file": self.requires_model_file,
             "confidence": self.confidence,
             "image_size": self.image_size,
             "class_weights": (str(self.class_weights_path)
@@ -170,7 +201,8 @@ class ModelPackage:
         return "<ModelPackage %s adapter=%s>" % (self.id, self.adapter)
 
 
-def _load_number_map(path: Path, field: str, cast=float) -> Dict[str, float]:
+def _load_number_map(path: Path, field: str, cast=float,
+                     require_int: bool = False) -> Dict[str, float]:
     if not path.exists():
         raise ModelPackageError("%s file not found: %s" % (field, path))
     try:
@@ -187,10 +219,42 @@ def _load_number_map(path: Path, field: str, cast=float) -> Dict[str, float]:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ModelPackageError("%s: value for '%s' must be a number, got %r"
                                     % (field, key, value))
+        if not math.isfinite(float(value)):
+            raise ModelPackageError("%s: value for '%s' must be finite, got %r"
+                                    % (field, key, value))
         if value < 0:
             raise ModelPackageError("%s: value for '%s' must not be negative" % (field, key))
+        if require_int and float(value) != int(value):
+            # Silently truncating 1.7 to 1 would quietly change how many
+            # instruments the tray is expected to hold.
+            raise ModelPackageError(
+                "%s: value for '%s' must be a whole number, got %r" % (field, key, value))
         out[key] = cast(value)
     return out
+
+
+def _cross_validate_inventory(standards: Mapping[str, int],
+                              class_weights: Mapping[str, float],
+                              where: str) -> None:
+    """Every expected instrument must have a usable unit weight.
+
+    Catching this at package-validation time keeps a half-configured package
+    from reaching the ward, where a missing weight would otherwise silently
+    lower the expected total and let an incomplete tray pass.
+    """
+    missing = []
+    for cls, qty in standards.items():
+        if int(qty or 0) <= 0:
+            continue
+        weight = class_weights.get(cls)
+        if weight is None:
+            missing.append("%s (no class weight)" % cls)
+        elif not math.isfinite(float(weight)) or float(weight) <= 0:
+            missing.append("%s (class weight %r is not a positive number)" % (cls, weight))
+    if missing:
+        raise ModelPackageError(
+            "%s: expected instruments have no usable class weight — %s"
+            % (where, "; ".join(sorted(missing))))
 
 
 def _resolve_path(raw: str, field: str, package_root: Path, project_root: Path) -> Path:
@@ -260,12 +324,14 @@ def load_manifest(
     adapter_options = data.get("adapter_options", {})
     _require(isinstance(adapter_options, dict), "'adapter_options' must be an object")
 
-    # model files
+    # model files — only required by adapters that actually read one
+    needs_model_file = adapter_requires_model_file(adapter)
     model_file: Optional[Path] = None
     fallback_file: Optional[Path] = None
     raw_model = data.get("model_file")
     if raw_model is None:
-        _require(is_template, "missing required field 'model_file'")
+        _require(is_template or not needs_model_file,
+                 "missing required field 'model_file' (adapter '%s' needs one)" % adapter)
     else:
         _require(isinstance(raw_model, str) and raw_model.strip(),
                  "'model_file' must be a non-empty string")
@@ -283,6 +349,8 @@ def load_manifest(
     confidence = inference.get("confidence", 0.25)
     _require(isinstance(confidence, (int, float)) and not isinstance(confidence, bool),
              "'inference.confidence' must be a number")
+    _require(math.isfinite(float(confidence)),
+             "'inference.confidence' must be finite, got %r" % (confidence,))
     _require(0.0 < float(confidence) <= 1.0,
              "'inference.confidence' must be in (0, 1], got %r" % (confidence,))
     image_size = inference.get("image_size")
@@ -346,9 +414,11 @@ def load_manifest(
     # not expected to exist yet, so they are not read.  It can be listed but
     # never activated.
     if not is_template:
-        package.load_class_weights()          # raises if missing / malformed
+        class_weights = package.load_class_weights()   # raises if missing / malformed
         if default_standards_path is not None:
-            package.load_default_standards()  # raises if malformed
+            default_standards = package.load_default_standards()  # raises if malformed
+            _cross_validate_inventory(default_standards, class_weights,
+                                      "inventory.default_standards")
         if default_unit_weights_path is not None:
             package.load_default_unit_weights()
 
@@ -376,6 +446,22 @@ class DiscoveredPackage:
     def is_template(self) -> bool:
         return bool(self.package is not None and self.package.is_template)
 
+    @property
+    def model_available(self) -> bool:
+        return bool(self.package is not None and self.package.model_available())
+
+    @property
+    def activatable(self) -> bool:
+        """Can the operator actually select this right now?
+
+        A valid manifest is not enough: without a model binary the activation
+        is guaranteed to fail, and offering it only to error out on click is a
+        worse experience than greying it out with the reason.
+        """
+        if self.package is None or self.package.is_template:
+            return False
+        return self.model_available
+
     def to_dict(self, *, active: bool = False) -> Dict[str, Any]:
         pkg = self.package
         return {
@@ -384,11 +470,16 @@ class DiscoveredPackage:
             "department": pkg.department if pkg else "",
             "adapter": pkg.adapter if pkg else "",
             "active": active,
+            # 'valid' is about the manifest; 'model_available' is about the
+            # binary on disk.  They are different problems with different fixes.
             "valid": self.valid,
             "template": self.is_template,
-            "activatable": self.valid and not self.is_template,
+            "model_available": self.model_available,
+            "activatable": self.activatable,
             "model_file": str(pkg.model_file) if (pkg and pkg.model_file) else "",
             "model_file_exists": pkg.model_file_exists() if pkg else False,
+            "requires_model_file": pkg.requires_model_file if pkg else True,
+            "model_error": pkg.model_error() if pkg else None,
             "error": self.error,
         }
 

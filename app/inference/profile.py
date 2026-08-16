@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import threading
+import threading  # noqa: F401  (used by save_json_atomic for a unique temp name)
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
@@ -29,10 +29,24 @@ logger = logging.getLogger(__name__)
 
 
 def save_json_atomic(path: Path, data: Any) -> None:
+    """Write JSON via a uniquely-named temp file + rename.
+
+    The temp name carries the thread id so two writers never share (and
+    truncate) the same scratch file.  That alone is not enough to prevent a
+    lost update — see PackageProfile, which holds its lock across
+    mutate-snapshot-write so the last rename always carries the newest state.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_suffix("%s.%d.tmp" % (path.suffix, threading.get_ident()))
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def _read_json_dict(path: Path) -> Optional[Dict[str, Any]]:
@@ -108,12 +122,17 @@ class PackageProfile:
 
     # ── writes ────────────────────────────────────────────────────────────
 
+    # Every mutation holds the lock across mutate -> snapshot -> write.  Doing
+    # the write outside the lock would let an operator edit and a
+    # register_classes() call interleave so that the older snapshot renames
+    # last and silently drops the newer change.
+
     def update_standards(self, values: Mapping[str, Any]) -> Dict[str, int]:
         parsed = _coerce_ints(values)
         with self._lock:
             self._standards.update(parsed)
             snapshot = dict(self._standards)
-        save_json_atomic(self.standards_path, snapshot)
+            save_json_atomic(self.standards_path, snapshot)
         return snapshot
 
     def update_unit_weights(self, values: Mapping[str, Any]) -> Dict[str, float]:
@@ -121,7 +140,7 @@ class PackageProfile:
         with self._lock:
             self._unit_weights.update(parsed)
             snapshot = dict(self._unit_weights)
-        save_json_atomic(self.unit_weights_path, snapshot)
+            save_json_atomic(self.unit_weights_path, snapshot)
         return snapshot
 
     def register_classes(self, class_names) -> bool:
@@ -141,12 +160,10 @@ class PackageProfile:
                 if key not in self._unit_weights:
                     self._unit_weights[key] = 0.0
                     changed_uw = True
-            std_snapshot = dict(self._standards)
-            uw_snapshot = dict(self._unit_weights)
-        if changed_std:
-            save_json_atomic(self.standards_path, std_snapshot)
-        if changed_uw:
-            save_json_atomic(self.unit_weights_path, uw_snapshot)
+            if changed_std:
+                save_json_atomic(self.standards_path, dict(self._standards))
+            if changed_uw:
+                save_json_atomic(self.unit_weights_path, dict(self._unit_weights))
         return changed_std or changed_uw
 
 

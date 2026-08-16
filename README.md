@@ -403,9 +403,24 @@ curl -s -X POST localhost:5000/api/model-package \
      -H 'Content-Type: application/json' -d '{"id":"ortho_tka"}' # switch
 ```
 
-Switching is atomic: the new model is loaded and warmed *before* the swap, so a
-failure leaves the previous package serving.  Results from the old package are
-discarded rather than reinterpreted under the new one's standards.
+Switching is an all-or-nothing transaction:
+
+1. recognition pauses, and any in-flight inference finishes first
+2. the **old model is released before the new one loads** — the Jetson has 4 GB,
+   so the two are never resident at the same time
+3. the new model must load, warm up, and be able to recognise every expected
+   instrument; failing any of those rolls the old model back into service
+4. results from the old package are cleared rather than reinterpreted under the
+   new one's standards
+5. recognition resumes if it was running — on success *and* on failure
+
+`ok: true` therefore means the model is loaded and usable, not merely accepted.
+While a startup load is still in progress `/status` reports `model_ready: false`
+with `model_loading: true`.
+
+Profile edits carry the package they were made against (`X-Model-Package`), so a
+debounced standards edit that arrives after a switch is refused with **409**
+rather than written onto the wrong department's tray.
 
 `adapter` must always be named explicitly.  **`.onnx` is a serialization format,
 not an inference contract** — two ONNX files can need entirely different
@@ -453,9 +468,21 @@ A PASS/FAIL verdict is only issued once the scale reading is both **fresh** and
 `null` — an unsettled scale is an unfinished measurement, not a failed
 inventory.  Tunable via `SCALE_STABLE_*` (see `.env.example`).
 
-Once the scale stops reporting (cable pulled, board reset) the cached value is
-reported with `fresh: false` and can no longer be verified, so a stale number
-never passes for a live one.
+Stability is measured over the span the *samples* cover, not how much wall time
+has passed, so a burst of readings followed by silence never counts as a settled
+second.  Once the scale stops reporting (cable pulled, board reset) the cached
+value is returned with `fresh: false` and can no longer be verified.
+
+A missing or non-positive class weight for an expected instrument also blocks
+any verdict (`reason: "missing_class_weights"`).  Treating it as 0 g would lower
+the expected total — exactly the direction that lets an incomplete tray pass.
+
+### Inventory rows are a union
+
+The results table and the CSV export list every class that is *expected or*
+detected.  An instrument the model missed entirely has no entry in the counts,
+so iterating detections alone would drop the most important row there is: the
+one showing 缺少.  See `app/inventory.py`; the kiosk UI mirrors it.
 
 ### Tests
 

@@ -307,3 +307,130 @@ def test_sample_to_dict_is_json_friendly():
     import json
     json.dumps(payload)     # must not raise
     assert set(payload) >= {"value", "fresh", "stable", "age_sec", "reason"}
+
+
+# ── SI-PLATFORM-002: coverage must measure samples, not wall time ───────────
+
+def test_time_passing_without_new_samples_does_not_create_coverage():
+    """Three readings in one burst are not a second of steady weighing.
+
+    Measuring coverage as (now - first sample) let the clock alone satisfy the
+    window: the scale went quiet after a burst and the reading "settled" purely
+    because time passed.
+    """
+    tracker, clock = make_tracker()
+    tracker.add(50.0); clock.advance(0.001)
+    tracker.add(50.0); clock.advance(0.001)
+    tracker.add(50.0)
+
+    # Enough time for the old wall-clock formula to claim full coverage, but
+    # still well inside max_sample_age so the reading is not merely stale.
+    clock.advance(0.9)
+
+    sample = tracker.snapshot()
+
+    assert sample.fresh is True                  # not a staleness problem
+    assert sample.coverage_sec == pytest.approx(0.002, abs=1e-6)
+    assert sample.stable is False
+    assert sample.reason == REASON_WARMING_UP
+
+
+def test_coverage_is_the_span_of_the_samples_themselves():
+    tracker, clock = make_tracker()
+    feed(tracker, clock, [50.0] * 10, step=0.1)   # 9 intervals -> 0.9 s span
+
+    sample = tracker.snapshot()
+
+    assert sample.coverage_sec == pytest.approx(0.9, abs=1e-6)
+    assert sample.stable is True
+
+
+def test_single_sample_has_no_coverage():
+    tracker, clock = make_tracker()
+    tracker.add(50.0)
+    clock.advance(1.0)
+    sample = tracker.snapshot()
+    assert sample.coverage_sec == 0.0
+    assert sample.stable is False
+
+
+def test_burst_then_real_sampling_becomes_stable():
+    tracker, clock = make_tracker()
+    tracker.add(50.0); clock.advance(0.001)
+    tracker.add(50.0); clock.advance(0.001)
+    tracker.add(50.0); clock.advance(0.9)
+    assert tracker.snapshot().stable is False
+
+    feed_steady(tracker, clock, 50.0)             # genuine 10 Hz sampling
+
+    assert tracker.snapshot().stable is True
+
+
+# ── SI-PLATFORM-002: a missing class weight can never yield PASS/FAIL ───────
+
+def test_missing_class_weight_blocks_any_verdict():
+    """standards A=2 (100 g) + B=1 with no weight for B.
+
+    Treating the missing weight as 0 g would expect 200 g, and a tray holding
+    only the A instruments would weigh exactly that and be declared complete —
+    with instrument B still missing.
+    """
+    wv = compute_weight_verification(
+        {"A": 2, "B": 1}, {"A": 100.0}, constant_sample(200.0), 0.5)
+
+    assert wv["ready"] is False
+    assert wv["passed"] is None
+    assert wv["reason"] == "missing_class_weights"
+    assert wv["missing_class_weights"] == ["B"]
+    assert wv["state"] == "no_standard_weight"
+    assert "B" in wv["message"]
+
+
+def test_missing_class_weight_blocks_even_a_perfectly_stable_reading():
+    tracker, clock = make_tracker()
+    feed_steady(tracker, clock, 200.0)
+    sample = tracker.snapshot()
+    assert sample.stable is True
+
+    wv = compute_weight_verification({"A": 2, "B": 1}, {"A": 100.0}, sample, 0.5)
+
+    assert wv["ready"] is False
+    assert wv["passed"] is None
+
+
+def test_classes_with_zero_standard_do_not_need_a_weight():
+    """Only instruments that are actually expected need a unit weight."""
+    wv = compute_weight_verification(
+        {"A": 2, "B": 0}, {"A": 100.0}, constant_sample(200.0), 0.5)
+    assert wv["missing_class_weights"] == []
+    assert wv["ready"] is True
+    assert wv["passed"] is True
+
+
+@pytest.mark.parametrize("bad_weight", [
+    0, 0.0, -5.0, float("nan"), float("inf"), float("-inf"), "heavy", None, True,
+])
+def test_invalid_class_weights_are_treated_as_missing(bad_weight):
+    wv = compute_weight_verification({"A": 1}, {"A": bad_weight},
+                                     constant_sample(10.0), 0.5)
+    assert wv["ready"] is False
+    assert wv["passed"] is None
+    assert wv["missing_class_weights"] == ["A"]
+
+
+def test_expected_weight_detail_reports_total_and_missing():
+    from app.weight_verification import expected_weight_detail
+
+    total, missing = expected_weight_detail({"A": 2, "B": 1, "C": 0},
+                                            {"A": 10.0, "C": 3.0})
+    assert total == 20.0
+    assert missing == ["B"]
+
+
+def test_fully_configured_package_is_unaffected():
+    wv = compute_weight_verification({"A": 2, "B": 1}, {"A": 100.0, "B": 5.0},
+                                     constant_sample(205.0), 0.5)
+    assert wv["missing_class_weights"] == []
+    assert wv["expected"] == 205.0
+    assert wv["ready"] is True
+    assert wv["passed"] is True

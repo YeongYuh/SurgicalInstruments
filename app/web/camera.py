@@ -432,6 +432,17 @@ class CameraThread(threading.Thread):
                 self._last_inference_end = t_end
 
     def _run_inference(self, frame, generation) -> None:
+        """Run one background inference and publish it, as a single transaction.
+
+        Everything model-dependent happens inside one ModelManager inference
+        session.  Holding the session across the publish is what closes the
+        window where a package switch could land between "my generation is
+        still current" and the actual write, leaving package B's UI showing
+        package A's counts.
+
+        The session serialises against the model, not against the capture loop,
+        so live preview keeps running at full rate while this executes.
+        """
         # Imported here (not at module top) to avoid a circular import at load time.
         import app.web as web_pkg
         from app.weight_verification import compute_weight_verification
@@ -439,121 +450,112 @@ class CameraThread(threading.Thread):
         t_worker_start = time.perf_counter()
         try:
             manager = web_pkg.model_manager
-            # One atomic snapshot: package, profile, adapter, and generation all
-            # belong to the same activation.  Reading them separately would allow
-            # a switch in between and pair one model's counts with another
-            # package's standards.
-            model_state = manager.state()
-            if not model_state.ready:
-                print(f"[CameraThread] session={self.session_id} "
-                      f"inference skipped — no active model package")
-                return
-            model_generation = model_state.generation
+            with manager.inference_session() as session:
+                h, w = frame.shape[:2]
+                imgsz = (config.CAMERA_INFERENCE_IMGSZ
+                         if config.CAMERA_INFERENCE_IMGSZ_EXPLICIT else None)
+                conf = config.CONF_THRESHOLD if config.CONF_THRESHOLD_EXPLICIT else None
+                if _debug:
+                    print(f"[CameraThread] session={self.session_id} "
+                          f"inference worker gen={generation} "
+                          f"package={session.package_id} frame={w}x{h} imgsz={imgsz}")
 
-            h, w = frame.shape[:2]
-            imgsz = (config.CAMERA_INFERENCE_IMGSZ
-                     if config.CAMERA_INFERENCE_IMGSZ_EXPLICIT else None)
-            conf = config.CONF_THRESHOLD if config.CONF_THRESHOLD_EXPLICIT else None
-            if _debug:
-                print(f"[CameraThread] session={self.session_id} "
-                      f"inference worker gen={generation} "
-                      f"package={model_state.package_id} frame={w}x{h} imgsz={imgsz}")
+                # ── inference — ONNX RT releases the GIL; preview keeps running ──
+                t0 = time.perf_counter()
+                result = session.infer(frame, conf=conf, imgsz=imgsz)
+                t_predict = time.perf_counter() - t0
+                counts = result.counts
 
-            # ── inference — ONNX RT releases the GIL; preview keeps running ──
-            t0 = time.perf_counter()
-            result = manager.infer(frame, conf=conf, imgsz=imgsz)
-            t_predict = time.perf_counter() - t0
-            counts = result.counts
+                # ── scale — non-blocking cached sample; serial I/O stays in the bg poll ──
+                t0 = time.perf_counter()
+                sample = web_pkg.scale_reader.get_latest_sample()
+                weight = sample.value
+                t_scale = time.perf_counter() - t0
 
-            # ── scale — non-blocking cached sample; serial I/O stays in the bg poll ──
-            t0 = time.perf_counter()
-            sample = web_pkg.scale_reader.get_latest_sample()
-            weight = sample.value
-            t_scale = time.perf_counter() - t0
+                # ── annotated image is intentionally skipped for camera mode ────
+                # The live preview is already the raw camera stream; generating an
+                # annotated JPEG here wastes CPU and is never shown.
 
-            # ── annotated image is intentionally skipped for camera mode ─────────────
-            # The live preview is already the raw camera stream; generating an
-            # annotated JPEG here wastes CPU and is never shown.
+                t0 = time.perf_counter()
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                std_snap = session.standards
+                class_weights = session.class_weights
+                wv = compute_weight_verification(
+                    std_snap, class_weights, sample, config.WEIGHT_TOLERANCE
+                )
+                t_prep = time.perf_counter() - t0
 
-            t0 = time.perf_counter()
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            std_snap = model_state.standards
-            class_weights = model_state.class_weights
-            wv = compute_weight_verification(
-                std_snap, class_weights, sample, config.WEIGHT_TOLERANCE
-            )
-            t_prep = time.perf_counter() - t0
+                total_ms = (time.perf_counter() - t_worker_start) * 1000
 
-            total_ms = (time.perf_counter() - t_worker_start) * 1000
+                # Always print the timing summary so slowness is visible without
+                # CAMERA_DEBUG.
+                weight_str = f"{weight:.1f}g" if weight is not None else "None"
+                print(
+                    f"[CameraThread] session={self.session_id} "
+                    f"inference gen={generation} model_gen={session.generation} "
+                    f"package={session.package_id} "
+                    f"predict={t_predict*1000:.0f}ms  "
+                    f"scale_cached={t_scale*1000:.1f}ms({weight_str},"
+                    f"{'stable' if sample.stable else sample.reason})  "
+                    f"other={(t_prep)*1000:.0f}ms  "
+                    f"total={total_ms:.0f}ms  "
+                    f"dets={len(result.detections)}"
+                )
 
-            # Always print the timing summary so slowness is visible without CAMERA_DEBUG.
-            weight_str = f"{weight:.1f}g" if weight is not None else "None"
-            print(
-                f"[CameraThread] session={self.session_id} "
-                f"inference gen={generation} model_gen={model_generation} "
-                f"package={model_state.package_id} "
-                f"predict={t_predict*1000:.0f}ms  "
-                f"scale_cached={t_scale*1000:.1f}ms({weight_str},"
-                f"{'stable' if sample.stable else sample.reason})  "
-                f"other={(t_prep)*1000:.0f}ms  "
-                f"total={total_ms:.0f}ms  "
-                f"dets={len(result.detections)}"
-            )
+                # The model package cannot have changed — the session pins it —
+                # so the only staleness left is the operator stopping camera or
+                # recognition while we ran.
+                with self._lock:
+                    stale = (self._stopping
+                             or not self._recognition_running
+                             or self._recognition_generation != generation)
+                    if not stale:
+                        self._counts = counts
+                        self._weight = weight
+                        self._timestamp = ts
+                        self._last_detection_ts = ts
+                        self._package_id = session.package_id
+                        self._package_display_name = session.display_name
+                        self._model_generation = session.generation
+                        # _latest_annotated intentionally not set in camera mode
 
-            # ── discard if stopping, recognition stopped, recognition generation
-            #    advanced, OR the active model package changed while we ran ──
-            model_changed = manager.generation != model_generation
-            with self._lock:
-                stale = (self._stopping
-                         or not self._recognition_running
-                         or self._recognition_generation != generation
-                         or model_changed)
-                if not stale:
-                    self._counts = counts
-                    self._weight = weight
-                    self._timestamp = ts
-                    self._last_detection_ts = ts
-                    self._package_id = model_state.package_id
-                    self._package_display_name = model_state.display_name
-                    self._model_generation = model_generation
-                    # _latest_annotated intentionally not set in camera mode
+                if stale:
+                    print(f"[CameraThread] session={self.session_id} "
+                          f"inference DISCARDED (stale) gen={generation} "
+                          f"model_gen={session.generation}")
+                    return
+                if _debug:
+                    print(f"[CameraThread] session={self.session_id} "
+                          f"inference PUBLISHED gen={generation}")
 
-            if stale:
-                why = "model package changed" if model_changed else "stale"
-                print(f"[CameraThread] session={self.session_id} "
-                      f"inference DISCARDED ({why}) gen={generation} "
-                      f"model_gen={model_generation}")
-                return
-            if _debug:
-                print(f"[CameraThread] session={self.session_id} "
-                      f"inference PUBLISHED gen={generation}")
+                with web_pkg.state_lock:
+                    web_pkg.latest_state.update({
+                        "timestamp": ts,
+                        "counts": copy.deepcopy(counts),
+                        "weight": weight,
+                        "annotated_b64": None,  # live preview is the raw stream
+                        "weight_verification": wv,
+                        "package_id": session.package_id,
+                        "package_display_name": session.display_name,
+                        "model_generation": session.generation,
+                    })
 
-            with web_pkg.state_lock:
-                web_pkg.latest_state.update({
-                    "timestamp": ts,
-                    "counts": copy.deepcopy(counts),
-                    "weight": weight,
-                    "annotated_b64": None,  # camera mode: live preview is the raw stream
-                    "weight_verification": wv,
-                    "package_id": model_state.package_id,
-                    "package_display_name": model_state.display_name,
-                    "model_generation": model_generation,
-                })
+                # Registers on the profile this inference actually ran against.
+                session.register_classes(counts.keys())
 
-            web_pkg.register_classes(counts.keys())
-
-            record = hist.make_record(
-                source="webcam",
-                counts=counts,
-                weight=weight,
-                standards_snapshot=std_snap,
-                package_id=model_state.package_id,
-                package_display_name=model_state.display_name,
-                model_identity=(result.model_info.identity() if result.model_info else None),
-                class_weights_snapshot=class_weights,
-                weight_verification=wv,
-            )
-            hist.append_record(record)
+                record = hist.make_record(
+                    source="webcam",
+                    counts=counts,
+                    weight=weight,
+                    standards_snapshot=std_snap,
+                    package_id=session.package_id,
+                    package_display_name=session.display_name,
+                    model_identity=(result.model_info.identity()
+                                    if result.model_info else None),
+                    class_weights_snapshot=class_weights,
+                    weight_verification=wv,
+                )
+                hist.append_record(record)
 
         except Exception as e:
             print(f"[CameraThread] Inference error: {e}")

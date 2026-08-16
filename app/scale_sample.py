@@ -130,7 +130,11 @@ class StabilityTracker:
         values = [s[2] for s in window]
         count = len(values)
         spread = (max(values) - min(values)) if values else None
-        coverage = (current - window[0][0]) if window else 0.0
+        # Coverage is the span the SAMPLES cover, not how much wall time has
+        # passed.  Using wall time would let three readings taken in a single
+        # millisecond "become" a stable second simply because the clock moved
+        # on after the scale went quiet.
+        coverage = (window[-1][0] - window[0][0]) if count >= 2 else 0.0
         required_coverage = self.window_sec * self.min_coverage_ratio
 
         if not fresh:

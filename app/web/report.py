@@ -4,13 +4,8 @@ import csv
 import io
 from typing import Any, Mapping, Optional, Sequence
 
+from app.inventory import compare_inventory, status_for
 from app.web.history import record_standards
-
-
-def _status(detected: int, standard: int) -> str:
-    if detected == standard:
-        return "正常"
-    return "缺少" if detected < standard else "多出"
 
 
 def generate_csv(records: Sequence[Mapping[str, Any]],
@@ -40,15 +35,18 @@ def generate_csv(records: Sequence[Mapping[str, Any]],
         pkg_name = rec.get("package_display_name") or ""
         rec_standards = record_standards(rec, standards)
 
-        if not counts:
+        # Union of expected and detected — see app/inventory.py.  An instrument
+        # the model missed entirely has no entry in counts, and iterating counts
+        # alone would drop the single most important row in the report.
+        rows = compare_inventory(counts, rec_standards)
+        if not rows:
             writer.writerow([ts, source, pkg_id, pkg_name, "", 0, "", "", weight_str])
             continue
 
-        for class_name, detected in sorted(counts.items()):
-            std = rec_standards.get(class_name, 0)
+        for row in rows:
             writer.writerow([
                 ts, source, pkg_id, pkg_name,
-                class_name, detected, std, _status(detected, std), weight_str,
+                row.class_name, row.detected, row.standard, row.status, weight_str,
             ])
 
     return buf.getvalue()

@@ -6,11 +6,17 @@ what a YOLO ``Results`` object looks like.  Everything above it sees plain
 
 Manifest options (``adapter_options``)::
 
-    "task"            "detect" | "segment" | "classify"  (required for .onnx)
+    "task"            "detect" | "segment"   (required for .onnx)
     "strict"          true  -> never fall back to fallback_model_file
     "include_masks"   true  -> attach segmentation masks to Detection.mask
                               (off by default: masks are large and the
                                inventory platform does not use them)
+
+Only detect and segment are supported.  Counting works by tallying detected
+instances, and a classifier produces no instances — it would load happily and
+then report an empty tray for every frame.  A classification-based inventory
+needs its own adapter, so ``task: classify`` is refused at load time rather
+than silently counting zero.
 """
 
 from __future__ import annotations
@@ -24,6 +30,12 @@ from app.inference.base import AdapterError, ModelAdapter
 from app.inference.types import Detection, InferenceResult, ModelInfo, counts_from_detections
 
 logger = logging.getLogger(__name__)
+
+
+#: Tasks whose Results objects carry per-instance detections we can count.
+SUPPORTED_TASKS = ("detect", "segment")
+#: Formats that cannot tell Ultralytics their own task, so the manifest must.
+TASK_REQUIRED_SUFFIXES = ("onnx", "engine", "tflite", "mlmodel", "xml", "pb")
 
 
 class UltralyticsAdapter(ModelAdapter):
@@ -59,6 +71,27 @@ class UltralyticsAdapter(ModelAdapter):
             % (pkg.id, primary,
                (" and %s" % fallback) if fallback is not None else ""))
 
+    def _validate_task(self, suffix: str) -> Optional[str]:
+        """Resolve and check the task before anything is loaded."""
+        raw = self.options.get("task")
+        task = str(raw).strip().lower() if raw else ""
+
+        if task and task not in SUPPORTED_TASKS:
+            raise AdapterError(
+                "unsupported Ultralytics task %r for inventory counting — this "
+                "adapter counts detected instances and supports only %s. A "
+                "classification-style model needs its own adapter."
+                % (task, " / ".join(SUPPORTED_TASKS)))
+
+        if not task and suffix in TASK_REQUIRED_SUFFIXES:
+            # An exported graph does not carry its task. Guessing here is how a
+            # demo model ends up "working" while counting the wrong thing.
+            raise AdapterError(
+                "adapter_options.task is required for a .%s model — set it to "
+                "one of %s in the package manifest"
+                % (suffix, " / ".join(SUPPORTED_TASKS)))
+        return task or None
+
     def _do_load(self) -> None:
         try:
             from ultralytics import YOLO
@@ -67,7 +100,7 @@ class UltralyticsAdapter(ModelAdapter):
 
         path = self._select_model_file()
         suffix = path.suffix.lower().lstrip(".")
-        task = self.options.get("task")
+        task = self._validate_task(suffix)
 
         kwargs = {}
         if task:

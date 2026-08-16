@@ -74,7 +74,13 @@ from flask import Response, jsonify, render_template, request, stream_with_conte
 
 import app.config as config
 import app.web as web_pkg
-from app.inference import ModelManagerError, available_adapters
+from app.inference import (
+    AdapterError,
+    ModelBusyError,
+    ModelManagerError,
+    PackageMismatchError,
+    available_adapters,
+)
 from app.visualizer import draw_detections
 from app.web import history as hist
 from app.web import report as rpt
@@ -110,85 +116,75 @@ def _inference_overrides():
 def _run_image_inference(image_bgr: np.ndarray, source_label: str) -> dict:
     """Single-shot inference on one image, published to the shared state.
 
-    Runs entirely against ONE atomic snapshot of the active package.  If the
-    package is switched while inference is running the result is refused rather
-    than published, because counts from one instrument family judged against
-    another family's standards are meaningless.
+    The whole transaction — model call, class registration, shared state, and
+    the history record — runs inside one inference session, so the active
+    package cannot change between producing the counts and publishing them.
     """
     manager = web_pkg.model_manager
-    model_state = manager.state()
-    if not model_state.ready:
-        return {
-            "ok": False,
-            "error": "尚未載入器械模型套件（%s）" % (manager.last_error or "未設定"),
-        }
-    model_generation = model_state.generation
-
-    conf, imgsz = _inference_overrides()
     try:
-        result = manager.infer(image_bgr, conf=conf, imgsz=imgsz)
+        with manager.inference_session() as session:
+            conf, imgsz = _inference_overrides()
+            result = session.infer(image_bgr, conf=conf, imgsz=imgsz)
+
+            counts = result.counts
+            sample = _current_sample()
+            weight = sample.value
+
+            annotated = draw_detections(image_bgr, result.detections)
+            _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            b64 = base64.b64encode(buf).decode()
+
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            std_snap = session.standards
+            class_weights = session.class_weights
+            wv = compute_weight_verification(
+                std_snap, class_weights, sample, config.WEIGHT_TOLERANCE)
+
+            with web_pkg.state_lock:
+                web_pkg.latest_state.update({
+                    "timestamp": ts,
+                    "counts": copy.deepcopy(counts),
+                    "weight": weight,
+                    "annotated_b64": b64,
+                    "weight_verification": wv,
+                    "package_id": session.package_id,
+                    "package_display_name": session.display_name,
+                    "model_generation": session.generation,
+                })
+
+            # Registers on the profile this inference actually ran against.
+            session.register_classes(counts.keys())
+
+            record = hist.make_record(
+                source=source_label,
+                counts=counts,
+                weight=weight,
+                standards_snapshot=std_snap,
+                package_id=session.package_id,
+                package_display_name=session.display_name,
+                model_identity=(result.model_info.identity() if result.model_info else None),
+                class_weights_snapshot=class_weights,
+                weight_verification=wv,
+            )
+            hist.append_record(record)
+
+            return {
+                "ok": True,
+                "timestamp": ts,
+                "counts": counts,
+                "annotated_image": b64,
+                "weight": weight,
+                "weight_sample": sample.to_dict(),
+                "weight_verification": wv,
+                "package_id": session.package_id,
+                "package_display_name": session.display_name,
+                "model_generation": session.generation,
+                "inference_ms": round(result.inference_ms, 1),
+            }
     except ModelManagerError as exc:
         return {"ok": False, "error": str(exc)}
-
-    if manager.generation != model_generation:
-        return {
-            "ok": False,
-            "error": "辨識過程中器械模型套件已切換，請重新辨識",
-            "model_changed": True,
-        }
-
-    counts = result.counts
-    sample = _current_sample()
-    weight = sample.value
-
-    annotated = draw_detections(image_bgr, result.detections)
-    _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    b64 = base64.b64encode(buf).decode()
-
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    std_snap = model_state.standards
-    class_weights = model_state.class_weights
-    wv = compute_weight_verification(std_snap, class_weights, sample, config.WEIGHT_TOLERANCE)
-
-    with web_pkg.state_lock:
-        web_pkg.latest_state.update({
-            "timestamp": ts,
-            "counts": copy.deepcopy(counts),
-            "weight": weight,
-            "annotated_b64": b64,
-            "weight_verification": wv,
-            "package_id": model_state.package_id,
-            "package_display_name": model_state.display_name,
-            "model_generation": model_generation,
-        })
-
-    web_pkg.register_classes(counts.keys())
-
-    record = hist.make_record(
-        source=source_label,
-        counts=counts,
-        weight=weight,
-        standards_snapshot=std_snap,
-        package_id=model_state.package_id,
-        package_display_name=model_state.display_name,
-        model_identity=(result.model_info.identity() if result.model_info else None),
-        class_weights_snapshot=class_weights,
-        weight_verification=wv,
-    )
-    hist.append_record(record)
-
-    return {
-        "ok": True,
-        "timestamp": ts,
-        "counts": counts,
-        "annotated_image": b64,
-        "weight": weight,
-        "weight_sample": sample.to_dict(),
-        "weight_verification": wv,
-        "package_id": model_state.package_id,
-        "package_display_name": model_state.display_name,
-        "inference_ms": round(result.inference_ms, 1),
-    }
+    except AdapterError as exc:
+        return {"ok": False, "error": "模型推理失敗：%s" % exc}
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -502,8 +498,18 @@ def camera_recognition_start():
         logger.debug("[/camera/recognition/start] cam=%s running=%s", cam, cam_running)
     if not cam_running:
         return jsonify(ok=False, error="Camera is not running"), 400
-    if not web_pkg.model_manager.state().ready:
-        return jsonify(ok=False, error="尚未載入器械模型套件"), 400
+    # Wait for the startup load rather than starting recognition against a
+    # model that is not there yet — otherwise the failure only surfaces at the
+    # first inference, long after the UI said recognition had started.
+    manager = web_pkg.model_manager
+    if not manager.wait_until_ready(timeout=30.0):
+        detail = manager.fatal_error or manager.last_error
+        if manager.loading:
+            return jsonify(ok=False, error="器械模型載入中，請稍候再試",
+                           model_loading=True), 503
+        return jsonify(ok=False,
+                       error="器械模型無法使用：%s" % (detail or "尚未載入"),
+                       model_loading=False), 503
     cam.start_recognition()
     _start_scale_bg_poll()   # idempotent — the thread normally runs already
     st = cam.get_status()
@@ -604,7 +610,8 @@ def status():
         inf_running  = False
         cam_stopping = False
         cam_recovering = False
-    model_state = web_pkg.model_manager.state()
+    manager = web_pkg.model_manager
+    model_state = manager.state()
     if config.CAMERA_DEBUG:
         logger.debug(
             "[/status] cam=%s stopping=%s rec=%s inf=%s sid=%s client=%s pkg=%s",
@@ -627,7 +634,14 @@ def status():
         "model_generation": model_state.generation,
         # generation under which the displayed counts were produced
         "result_model_generation": state.get("model_generation"),
+        # ready means the model is actually loaded and can run — a package
+        # being selected is not the same thing as a model being usable.
         "model_ready": model_state.ready,
+        "model_configured": model_state.configured,
+        "model_loading": manager.loading,
+        "model_warmup_error": (model_state.adapter.warmup_error
+                               if model_state.adapter is not None else None),
+        "model_error": manager.fatal_error or manager.last_error,
     })
     return jsonify(payload)
 
@@ -652,19 +666,48 @@ def api_model_package_get():
     return jsonify(ok=True, **web_pkg.model_manager.model_info())
 
 
+def _camera_snapshot():
+    with web_pkg.state_lock:
+        cam = web_pkg.camera_thread
+    if cam is None or not cam.is_running():
+        return cam, False, False
+    status = cam.get_status()
+    return cam, True, bool(status.get("recognition_running"))
+
+
+def _resume_recognition(cam, was_recognizing: bool) -> bool:
+    """Put recognition back the way the operator left it.
+
+    Recognition is the operator's stated intent, not a side effect of the
+    switch.  Stopping it to change models and then leaving it stopped means a
+    failed switch silently downgraded a working system, and a successful one
+    makes the operator press 開始辨識 again for no reason.
+    """
+    if not was_recognizing or cam is None or not cam.is_running():
+        return False
+    if not web_pkg.model_manager.state().ready:
+        logger.warning("[model-switch] not resuming recognition — model is not ready")
+        return False
+    cam.start_recognition()
+    _start_scale_bg_poll()
+    logger.info("[model-switch] recognition resumed")
+    return True
+
+
 @app.route("/api/model-package", methods=["POST"])
 def api_model_package_post():
     """Switch the active model package.
 
-    The response is only ``ok`` once the new model is actually loaded and
-    usable — activation is fully synchronous, so a success here means the next
-    inference will run on the new package.
+    ``ok`` means the new model is loaded, warmed, and compatible with the
+    package's expected instruments — activation is fully synchronous, and its
+    warmup is a verification gate rather than a best-effort nicety.
 
-    Order matters: recognition is stopped first so no worker starts against the
-    old package mid-switch; ModelManager.activate() then loads everything before
-    swapping, so a failure leaves the previous package serving; finally the
-    stale runtime results are cleared, because counts from the old instrument
-    family mean nothing under the new one.
+    Order matters: recognition is paused first so no worker starts against the
+    old package mid-switch; ModelManager.activate() releases the old model
+    before loading the new one (never two resident) and rolls the old one back
+    on any failure; stale results are then cleared, because counts from the old
+    instrument family mean nothing under the new one; finally the operator's
+    recognition intent is restored either way.
     """
     data = request.get_json(silent=True)
     if not isinstance(data, dict) or not data.get("id"):
@@ -672,28 +715,36 @@ def api_model_package_post():
     package_id = str(data["id"])
 
     manager = web_pkg.model_manager
+    cam, camera_running, was_recognizing = _camera_snapshot()
+
     current = manager.state()
     if current.ready and current.package_id == package_id:
-        return jsonify(ok=True, status="already_active", **manager.model_info())
+        return jsonify(ok=True, status="already_active",
+                       camera_running=camera_running,
+                       recognition_was_running=was_recognizing,
+                       recognition_resumed=was_recognizing,
+                       **manager.model_info())
 
-    with web_pkg.state_lock:
-        cam = web_pkg.camera_thread
-    was_recognizing = False
-    if cam is not None and cam.is_running():
-        was_recognizing = bool(cam.get_status().get("recognition_running"))
-        if was_recognizing:
-            logger.info("[model-switch] pausing recognition for switch to '%s'", package_id)
-            cam.stop_recognition()
+    if was_recognizing:
+        logger.info("[model-switch] pausing recognition for switch to '%s'", package_id)
+        cam.stop_recognition()
 
     try:
         manager.activate(package_id)
-    except ModelManagerError as exc:
+    except (ModelManagerError, ModelBusyError) as exc:
         logger.error("[model-switch] failed: %s", exc)
+        # activate() has already rolled the previous model back into service.
+        resumed = _resume_recognition(cam, was_recognizing)
+        state = manager.state()
         return jsonify(
             ok=False,
             error=str(exc),
-            active=manager.state().package_id or None,
-            recognition_resumed=False,
+            active=state.package_id or None,
+            model_ready=state.ready,
+            fatal_error=manager.fatal_error,
+            camera_running=camera_running,
+            recognition_was_running=was_recognizing,
+            recognition_resumed=resumed,
         ), 400
 
     # Invalidate everything produced by the previous package.
@@ -701,12 +752,16 @@ def api_model_package_post():
     if cam is not None:
         cam.invalidate_results()
 
+    resumed = _resume_recognition(cam, was_recognizing)
     logger.info("[model-switch] now active: '%s' (generation=%d)",
                 package_id, manager.generation)
     return jsonify(
         ok=True,
         status="switched",
+        camera_running=camera_running,
+        recognition_was_running=was_recognizing,
         recognition_stopped=was_recognizing,
+        recognition_resumed=resumed,
         **manager.model_info(),
     )
 
@@ -756,6 +811,36 @@ def bom_report():
     )
 
 
+def _parse_profile_payload(data):
+    """Split a profile edit into (target package id, values).
+
+    Accepts the wrapped form ``{"package_id": …, "values": {…}}`` and the
+    ``X-Model-Package`` header; a bare ``{class: n}`` body still works for
+    older clients, but then carries no package identity and is accepted
+    against whatever is active.
+    """
+    header_pkg = request.headers.get("X-Model-Package") or None
+    if isinstance(data, dict) and isinstance(data.get("values"), dict):
+        return (data.get("package_id") or header_pkg), data["values"]
+    return header_pkg, data
+
+
+def _mismatch_response(exc: PackageMismatchError):
+    """409: the edit belonged to a package that is no longer active.
+
+    Writing it anyway would stamp one department's expected quantities onto
+    another's tray, which is precisely what a debounced edit racing a package
+    switch would otherwise do.
+    """
+    return jsonify(
+        ok=False,
+        error="設定已套用到其他器械套件，請重新編輯",
+        detail=str(exc),
+        requested_package=exc.requested,
+        active_package=exc.active,
+    ), 409
+
+
 @app.route("/standards", methods=["GET"])
 def get_standards():
     return jsonify(web_pkg.get_standards())
@@ -763,20 +848,22 @@ def get_standards():
 
 @app.route("/standards", methods=["POST"])
 def post_standards():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
+    package_id, values = _parse_profile_payload(request.get_json(silent=True))
+    if not isinstance(values, dict):
         return jsonify(ok=False, error="Expected JSON object"), 400
     parsed = {}
-    for k, v in data.items():
+    for k, v in values.items():
         try:
             parsed[str(k)] = max(0, int(v))
         except (ValueError, TypeError):
             return jsonify(ok=False, error=f"Invalid value for '{k}': {v}"), 400
     try:
-        web_pkg.update_standards(parsed)
+        web_pkg.update_standards(parsed, package_id=package_id)
+    except PackageMismatchError as exc:
+        return _mismatch_response(exc)
     except ModelManagerError as exc:
         return jsonify(ok=False, error=str(exc)), 409
-    return jsonify(ok=True)
+    return jsonify(ok=True, package_id=web_pkg.model_manager.state().package_id or None)
 
 
 @app.route("/class_weights")
@@ -792,20 +879,22 @@ def get_unit_weights():
 
 @app.route("/unit_weights", methods=["POST"])
 def post_unit_weights():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
+    package_id, values = _parse_profile_payload(request.get_json(silent=True))
+    if not isinstance(values, dict):
         return jsonify(ok=False, error="Expected JSON object"), 400
     parsed = {}
-    for k, v in data.items():
+    for k, v in values.items():
         try:
             parsed[str(k)] = max(0.0, float(v))
         except (ValueError, TypeError):
             return jsonify(ok=False, error=f"Invalid value for '{k}': {v}"), 400
     try:
-        web_pkg.update_unit_weights(parsed)
+        web_pkg.update_unit_weights(parsed, package_id=package_id)
+    except PackageMismatchError as exc:
+        return _mismatch_response(exc)
     except ModelManagerError as exc:
         return jsonify(ok=False, error=str(exc)), 409
-    return jsonify(ok=True)
+    return jsonify(ok=True, package_id=web_pkg.model_manager.state().package_id or None)
 
 
 @app.route("/system/shutdown", methods=["POST"])

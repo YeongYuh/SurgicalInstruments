@@ -126,7 +126,7 @@ def test_failed_switch_leaves_the_previous_package_serving(api):
 
     assert response.status_code == 400
     assert payload["ok"] is False
-    assert "failed to load model" in payload["error"]
+    assert "failed to activate package" in payload["error"]
     assert payload["active"] == "ortho"
     # Still fully operational on the old package.
     assert manager.state().package_id == "ortho"
@@ -268,3 +268,122 @@ def test_report_export_is_package_aware(api):
     # though the active package is orthopaedics and has no 'forceps' class.
     assert "正常" in body
     assert "多出" not in body
+
+
+# ── SI-PLATFORM-002: model_ready must mean the model can actually run ───────
+
+def test_status_reports_ready_when_the_model_is_loaded(api):
+    client, _ = api
+    status = _json(client.get("/status"))
+    assert status["model_ready"] is True
+    assert status["model_configured"] is True
+    assert status["model_loading"] is False
+    assert status["model_error"] is None
+
+
+def test_status_is_not_ready_while_the_model_is_still_loading(api, tmp_path, monkeypatch):
+    """A selected package is not the same as a usable model."""
+    from conftest import make_manager, write_package as _write
+
+    manager = make_manager(tmp_path / "slow")
+    _write(manager.packages_dir, "slow",
+           class_weights={"widget": 1.0}, standards={"widget": 1},
+           adapter_options={"load_delay": 0.4})
+    manager.bootstrap("slow", background=True)
+    monkeypatch.setattr(web_pkg, "model_manager", manager)
+
+    status = _json(client_of(api).get("/status"))
+    assert status["model_configured"] is True
+    assert status["model_ready"] is False
+    assert status["model_loading"] is True
+
+    assert manager.wait_until_ready(timeout=10.0) is True
+    status = _json(client_of(api).get("/status"))
+    assert status["model_ready"] is True
+    assert status["model_loading"] is False
+
+
+def test_status_exposes_a_startup_load_failure(api, tmp_path, monkeypatch):
+    from conftest import make_manager, write_package as _write
+
+    manager = make_manager(tmp_path / "broken")
+    _write(manager.packages_dir, "boom",
+           class_weights={"widget": 1.0}, standards={"widget": 1},
+           adapter_options={"fail_load": True})
+    manager.bootstrap("boom", background=False)
+    monkeypatch.setattr(web_pkg, "model_manager", manager)
+
+    status = _json(client_of(api).get("/status"))
+
+    assert status["model_ready"] is False
+    assert status["model_loading"] is False
+    assert status["model_error"]
+    info = _json(client_of(api).get("/api/model-package"))
+    assert info["ready"] is False
+    assert info["loaded"] is False
+
+
+def client_of(api):
+    return api[0]
+
+
+def test_recognition_start_refuses_while_the_model_is_unusable(api, tmp_path, monkeypatch):
+    """Better a clear 503 than a UI that says 辨識中 over a broken model."""
+    from conftest import make_manager, write_package as _write
+
+    manager = make_manager(tmp_path / "broken2")
+    _write(manager.packages_dir, "boom",
+           class_weights={"widget": 1.0}, standards={"widget": 1},
+           adapter_options={"fail_load": True})
+    manager.bootstrap("boom", background=False)
+    monkeypatch.setattr(web_pkg, "model_manager", manager)
+
+    class _Cam:
+        def is_running(self):
+            return True
+
+        def get_status(self):
+            return {"running": True, "recognition_running": False,
+                    "inference_running": False, "recognition_generation": 0}
+
+        def start_recognition(self):
+            raise AssertionError("recognition must not start on an unusable model")
+
+    monkeypatch.setattr(web_pkg, "camera_thread", _Cam(), raising=False)
+
+    response = client_of(api).post("/camera/recognition/start")
+
+    assert response.status_code == 503
+    assert _json(response)["ok"] is False
+
+
+def test_model_package_info_includes_compatibility_diagnostics(api):
+    client, _ = api
+    info = _json(client.get("/api/model-package"))
+    assert "compatibility" in info
+    diagnostics = info["compatibility"]
+    # FakeAdapter publishes no class list, so the check is skipped rather than
+    # guessed — and says so.
+    assert diagnostics["has_model_class_list"] is False
+    assert diagnostics["standards_missing_class_weight"] == []
+
+
+def test_upload_result_carries_the_generation_it_ran_under(api):
+    client, _ = api
+    import io as _io
+
+    import cv2
+    import numpy as np
+
+    ok, buf = cv2.imencode(".jpg", np.zeros((32, 32, 3), dtype=np.uint8))
+    assert ok
+    payload = _json(client.post(
+        "/upload",
+        data={"image": (_io.BytesIO(buf.tobytes()), "f.jpg")},
+        content_type="multipart/form-data",
+    ))
+    assert payload["model_generation"] == 1
+
+    status = _json(client.get("/status"))
+    assert status["result_model_generation"] == 1
+    assert status["model_generation"] == 1

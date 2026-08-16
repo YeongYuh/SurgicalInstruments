@@ -4,20 +4,40 @@ Responsibilities
 ----------------
 * discover and validate packages
 * build the right adapter from the adapter registry
-* keep exactly ONE model loaded (Jetson Nano has 4 GB — preloading every
-  package is not an option)
-* switch packages atomically, so the platform is never in a half-switched
-  "new standards + old model" state
-* hand out a monotonically increasing ``generation`` so background workers can
-  discard results produced by a package that is no longer active
+* keep exactly ONE model resident at any instant, including *during* a switch
+  (Jetson Nano has 4 GB — two heavy models at once is an OOM, not a hiccup)
+* switch packages as an all-or-nothing transaction, rolling the previous
+  package back into service if anything fails
+* pin a whole inference transaction — model, package, profile, standards,
+  class weights, generation — so results can never be published against a
+  package that replaced the one they were produced under
+
+Lifecycle gate
+--------------
+One lock, ``_exec_lock``, serialises everything that touches a loaded model:
+
+    inference session   (infer + publish, held for the whole transaction)
+    package switch      (unload old -> load new -> warm -> publish)
+    startup background load
+
+Holding it for the whole inference *transaction* — not just the ``infer()``
+call — is what closes the publication race: a switch cannot land between the
+generation check and the write, because the switch cannot start until the
+transaction has finished.
+
+Lock order is always ``_switch_lock`` -> ``_exec_lock`` -> ``_state_lock``,
+and callers layer their own locks (web state, camera thread) *below* the
+session, never above it.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.inference.base import ModelAdapter
 from app.inference.package import (
@@ -32,9 +52,35 @@ from app.inference.types import InferenceResult, ModelInfo
 
 logger = logging.getLogger(__name__)
 
+#: How long an inference session waits for the lifecycle gate before giving up.
+#: Comfortably longer than a slow Jetson inference (~2 s) plus a package switch
+#: (~10 s), so a legitimate wait never trips it.
+DEFAULT_SESSION_TIMEOUT = 120.0
+
 
 class ModelManagerError(RuntimeError):
     """Raised when a package cannot be activated or no model is active."""
+
+
+class PackageMismatchError(ModelManagerError):
+    """A request targeted a package that is no longer the active one."""
+
+    def __init__(self, requested: Optional[str], active: Optional[str]) -> None:
+        self.requested = requested
+        self.active = active
+        super().__init__(
+            "request targets model package %r but %r is active"
+            % (requested, active))
+
+
+class ModelBusyError(ModelManagerError):
+    """The lifecycle gate could not be acquired in time."""
+
+
+def _usable_weight(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value)) and float(value) > 0
 
 
 class ActiveState:
@@ -55,8 +101,20 @@ class ActiveState:
         self.adapter = adapter
 
     @property
+    def configured(self) -> bool:
+        """A package is selected and its inventory data is loaded.
+
+        Enough to serve /standards and render the UI; NOT enough to promise
+        that inference will work.
+        """
+        return self.package is not None and self.profile is not None \
+            and self.adapter is not None
+
+    @property
     def ready(self) -> bool:
-        return self.package is not None and self.profile is not None and self.adapter is not None
+        """The model is actually loaded and can run right now."""
+        return self.configured and bool(self.adapter and self.adapter.loaded
+                                        and not self.adapter.retired)
 
     @property
     def package_id(self) -> str:
@@ -79,6 +137,73 @@ class ActiveState:
         return self.profile.unit_weights if self.profile else {}
 
 
+class InferenceSession:
+    """A pinned inference transaction.
+
+    While the session is open the active package cannot change, so everything
+    reached through it — model, standards, class weights, profile, generation —
+    belongs to the same activation, from the frame going in to the history
+    record coming out.
+    """
+
+    __slots__ = ("_manager", "state")
+
+    def __init__(self, manager: "ModelManager", state: ActiveState) -> None:
+        self._manager = manager
+        self.state = state
+
+    # identity of the pinned activation
+    @property
+    def generation(self) -> int:
+        return self.state.generation
+
+    @property
+    def package(self) -> Optional[ModelPackage]:
+        return self.state.package
+
+    @property
+    def profile(self) -> Optional[PackageProfile]:
+        return self.state.profile
+
+    @property
+    def package_id(self) -> str:
+        return self.state.package_id
+
+    @property
+    def display_name(self) -> str:
+        return self.state.display_name
+
+    @property
+    def standards(self) -> Dict[str, int]:
+        return self.state.standards
+
+    @property
+    def class_weights(self) -> Dict[str, float]:
+        return self.state.class_weights
+
+    def infer(self, image: Any, conf: Optional[float] = None,
+              imgsz: Optional[int] = None) -> InferenceResult:
+        adapter = self.state.adapter
+        if adapter is None:
+            raise ModelManagerError("no active model package")
+        result = adapter.infer(image, conf=conf, imgsz=imgsz)
+        result.metadata.setdefault("generation", self.state.generation)
+        result.metadata.setdefault("package_id", self.state.package_id)
+        return result
+
+    def register_classes(self, class_names: Iterable[str]) -> bool:
+        """Register newly seen classes on the package that produced them.
+
+        Uses the profile captured by this session, never "whichever profile is
+        active now" — otherwise an orthopaedic detection finishing just after a
+        switch would add its classes to the obstetric package.
+        """
+        profile = self.state.profile
+        if profile is None:
+            return False
+        return profile.register_classes(class_names)
+
+
 class ModelManager:
     def __init__(
         self,
@@ -89,6 +214,7 @@ class ModelManager:
         legacy_package_id: Optional[str] = None,
         legacy_standards_path: Optional[Path] = None,
         legacy_unit_weights_path: Optional[Path] = None,
+        session_timeout: float = DEFAULT_SESSION_TIMEOUT,
     ) -> None:
         self.packages_dir = Path(packages_dir)
         self.profiles_dir = Path(profiles_dir)
@@ -96,16 +222,22 @@ class ModelManager:
         self.legacy_package_id = legacy_package_id
         self.legacy_standards_path = legacy_standards_path
         self.legacy_unit_weights_path = legacy_unit_weights_path
+        self.session_timeout = session_timeout
 
-        self._state_lock = threading.RLock()   # guards the active tuple
+        self._state_lock = threading.RLock()   # guards the active tuple (fast reads)
         self._switch_lock = threading.Lock()   # serialises activations
+        self._exec_lock = threading.RLock()    # THE model lifecycle gate
+        self._ready_event = threading.Event()
+
         self._generation = 0
         self._package: Optional[ModelPackage] = None
         self._profile: Optional[PackageProfile] = None
         self._adapter: Optional[ModelAdapter] = None
         self._packages: Dict[str, DiscoveredPackage] = {}
         self._last_error: Optional[str] = None
+        self._fatal_error: Optional[str] = None
         self._loading = False
+        self._compatibility: Dict[str, Any] = {}
 
     # ── discovery ─────────────────────────────────────────────────────────
 
@@ -128,7 +260,7 @@ class ModelManager:
         """Look up a package, rescanning if it is not already known.
 
         The rescan matters operationally: dropping a new package directory onto
-        a running kiosk should make it selectable, without restarting the unit.
+        a running kiosk should make it selectable without restarting the unit.
         Discovery is JSON-only, so the extra scan is cheap.
         """
         if not self._packages or package_id not in self._packages:
@@ -166,6 +298,63 @@ class ModelManager:
         with self._state_lock:
             return self._last_error
 
+    @property
+    def fatal_error(self) -> Optional[str]:
+        with self._state_lock:
+            return self._fatal_error
+
+    @property
+    def loading(self) -> bool:
+        with self._state_lock:
+            return self._loading
+
+    @property
+    def compatibility(self) -> Dict[str, Any]:
+        with self._state_lock:
+            return dict(self._compatibility)
+
+    def wait_until_ready(self, timeout: float = 30.0) -> bool:
+        """Block until the active model is loaded, or the timeout expires."""
+        if self.state().ready:
+            return True
+        self._ready_event.wait(timeout=timeout)
+        return self.state().ready
+
+    # ── the lifecycle gate ────────────────────────────────────────────────
+
+    @contextmanager
+    def _gate(self, timeout: Optional[float] = None, what: str = "operation"):
+        wait = self.session_timeout if timeout is None else timeout
+        acquired = self._exec_lock.acquire(timeout=wait)
+        if not acquired:
+            raise ModelBusyError(
+                "model is busy — %s timed out after %.0fs waiting for the "
+                "lifecycle gate" % (what, wait))
+        try:
+            yield
+        finally:
+            self._exec_lock.release()
+
+    @contextmanager
+    def inference_session(self, timeout: Optional[float] = None):
+        """Pin the active package for a whole inference transaction.
+
+        Everything model-dependent — running the model, computing counts,
+        publishing state, registering classes, writing history — belongs inside
+        the ``with`` block.  A package switch cannot begin until it closes, so
+        no result can ever be published against a package that replaced the one
+        it came from.
+        """
+        with self._gate(timeout, what="inference"):
+            state = self.state()
+            if not state.configured:
+                raise ModelManagerError(
+                    "no active model package (%s)" % (self.last_error or "not configured"))
+            fatal = self.fatal_error
+            if fatal:
+                raise ModelManagerError("model is not usable: %s" % fatal)
+            yield InferenceSession(self, state)
+
     # ── activation ────────────────────────────────────────────────────────
 
     def _resolve_for_activation(self, package_id: str) -> ModelPackage:
@@ -183,16 +372,14 @@ class ModelManager:
                 "model package '%s' is a template — fill in its manifest "
                 "(model_file, adapter, inventory.class_weights) before activating it"
                 % package_id)
+        if not entry.package.model_available():
+            raise ModelManagerError(
+                "model package '%s' has no model file to load: %s"
+                % (package_id, entry.package.model_error()))
         return entry.package
 
-    def _build(self, package: ModelPackage) -> Tuple[ModelAdapter, PackageProfile]:
-        """Create + load a fresh adapter and profile.  Raises on failure."""
-        try:
-            adapter_cls = get_adapter_class(package.adapter)
-        except UnknownAdapterError as exc:
-            raise ModelManagerError(str(exc))
-
-        profile = load_profile(
+    def _load_profile_for(self, package: ModelPackage) -> PackageProfile:
+        return load_profile(
             package,
             self.profiles_dir,
             legacy_package_id=self.legacy_package_id,
@@ -200,44 +387,99 @@ class ModelManager:
             legacy_unit_weights_path=self.legacy_unit_weights_path,
         )
 
-        adapter = adapter_cls(package)
-        try:
-            adapter.load()
-        except Exception as exc:
-            try:
-                adapter.unload()
-            except Exception:  # noqa: BLE001 - best effort cleanup
-                pass
+    def _build_compatibility(self, profile: PackageProfile,
+                             adapter: ModelAdapter) -> Dict[str, Any]:
+        """Compare what the model can recognise with what the package expects."""
+        info: ModelInfo = adapter.model_info
+        model_classes = [str(c) for c in (info.class_names or [])]
+        has_list = bool(model_classes)
+        model_set = set(model_classes)
+        standards = profile.standards
+        class_weights = profile.class_weights
+        positive = {cls for cls, qty in standards.items() if int(qty or 0) > 0}
+
+        return {
+            "has_model_class_list": has_list,
+            "model_classes": len(model_classes),
+            "model_classes_missing_weight": (
+                sorted(model_set - set(class_weights)) if has_list else []),
+            "standards_not_in_model": (
+                sorted(positive - model_set) if has_list else []),
+            "unused_class_weights": (
+                sorted(set(class_weights) - model_set) if has_list else []),
+            "standards_missing_class_weight": sorted(
+                cls for cls in positive if not _usable_weight(class_weights.get(cls))),
+        }
+
+    def _assert_compatible(self, package: ModelPackage, diagnostics: Dict[str, Any]) -> None:
+        """Refuse an activation the model can never satisfy.
+
+        A standard that names a class the model has no output for means the
+        tray can never be reported complete — better to fail the switch loudly
+        than to run an inventory that is structurally incapable of passing.
+        Only enforced when the adapter published a full class list.
+        """
+        if not diagnostics.get("has_model_class_list"):
+            return
+        missing = diagnostics.get("standards_not_in_model") or []
+        if missing:
             raise ModelManagerError(
-                "failed to load model for package '%s' (%s): %s"
-                % (package.id, package.adapter, exc))
-        return adapter, profile
+                "model for package '%s' cannot recognise expected instrument(s): %s"
+                % (package.id, ", ".join(missing)))
 
     def _publish(self, package: ModelPackage, profile: PackageProfile,
-                 adapter: ModelAdapter) -> int:
-        """Atomically swap in the new triple and return the new generation."""
+                 adapter: ModelAdapter, compatibility: Dict[str, Any]) -> int:
         with self._state_lock:
-            previous = self._adapter
             self._package = package
             self._profile = profile
             self._adapter = adapter
+            self._compatibility = dict(compatibility)
             self._generation += 1
             self._last_error = None
+            self._fatal_error = None
             generation = self._generation
-        # Release the old model outside the lock — unload can be slow.
-        if previous is not None and previous is not adapter:
-            try:
-                previous.unload()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[models] error releasing previous adapter: %s", exc)
+        if adapter.loaded:
+            self._ready_event.set()
+        else:
+            self._ready_event.clear()
         return generation
 
-    def activate(self, package_id: str, *, warmup: bool = True) -> ActiveState:
-        """Fully synchronous package switch.
+    def _restore(self, package: Optional[ModelPackage], profile: Optional[PackageProfile],
+                 adapter: Optional[ModelAdapter]) -> None:
+        """Bring the previous package back into service after a failed switch.
 
-        Everything that can fail (validation, adapter construction, model load,
-        profile load) happens BEFORE the swap, so a failure leaves the
-        previously working package untouched and still serving.
+        Called with the lifecycle gate held.  If the old model refuses to load
+        again the manager goes into an explicit fatal state rather than
+        reporting an operational system that cannot actually run.
+        """
+        if adapter is None or package is None:
+            return
+        try:
+            adapter.load()
+            adapter.warmup()      # lenient: the model already loaded once
+            with self._state_lock:
+                self._package = package
+                self._profile = profile
+                self._adapter = adapter
+                self._fatal_error = None
+            self._ready_event.set()
+            logger.info("[models] rolled back to package '%s'", package.id)
+        except Exception as exc:  # noqa: BLE001
+            message = ("rollback failed: package '%s' could not be reloaded: %s"
+                       % (package.id, exc))
+            with self._state_lock:
+                self._fatal_error = message
+                self._last_error = message
+            self._ready_event.clear()
+            logger.error("[models] %s", message)
+
+    def activate(self, package_id: str, *, warmup: bool = True,
+                 strict_warmup: bool = True, timeout: Optional[float] = None) -> ActiveState:
+        """Switch the active package.  All-or-nothing.
+
+        The old model is released BEFORE the new one is loaded, so the two are
+        never resident at the same time.  If anything then fails, the old model
+        is loaded again and stays in service.
         """
         with self._switch_lock:
             current = self.state()
@@ -245,24 +487,64 @@ class ModelManager:
                 logger.info("[models] package '%s' already active", package_id)
                 return current
 
+            # Validation and profile loading are pure JSON work — done outside
+            # the gate so a slow inference does not delay reporting a bad id.
             package = self._resolve_for_activation(package_id)
+            try:
+                adapter_cls = get_adapter_class(package.adapter)
+            except UnknownAdapterError as exc:
+                raise ModelManagerError(str(exc))
+            profile = self._load_profile_for(package)
+            new_adapter = adapter_cls(package)   # object only; loads nothing
+
             logger.info("[models] activating package '%s' (adapter=%s)",
                         package.id, package.adapter)
-            with self._state_lock:
-                self._loading = True
-            try:
-                adapter, profile = self._build(package)
-                if warmup:
-                    adapter.warmup()   # best effort; error recorded in model_info
-                generation = self._publish(package, profile, adapter)
-            except ModelManagerError as exc:
+
+            with self._gate(timeout, what="package switch"):
+                old_adapter = self._adapter
+                old_package = self._package
+                old_profile = self._profile
                 with self._state_lock:
-                    self._last_error = str(exc)
-                logger.error("[models] activation of '%s' failed: %s", package_id, exc)
-                raise
-            finally:
+                    self._loading = True
+                self._ready_event.clear()
+                try:
+                    # 1. free the old model first — never two heavy models resident
+                    if old_adapter is not None:
+                        old_adapter.unload()
+                    # 2. load the replacement
+                    new_adapter.load()
+                    # 3. warmup is the verification gate for a runtime switch:
+                    #    reporting success for a model that cannot run would be
+                    #    discovered mid-inventory instead of now.
+                    if warmup:
+                        new_adapter.warmup(strict=strict_warmup)
+                    # 4. the model must be able to recognise what is expected
+                    compatibility = self._build_compatibility(profile, new_adapter)
+                    self._assert_compatible(package, compatibility)
+                except Exception as exc:  # noqa: BLE001 - any failure rolls back
+                    message = ("failed to activate package '%s' (%s): %s"
+                               % (package.id, package.adapter, exc))
+                    try:
+                        new_adapter.retire()
+                    except Exception:  # noqa: BLE001 - best-effort cleanup
+                        pass
+                    self._restore(old_package, old_profile, old_adapter)
+                    with self._state_lock:
+                        self._last_error = message
+                        self._loading = False
+                    logger.error("[models] %s", message)
+                    raise ModelManagerError(message)
+
+                generation = self._publish(package, profile, new_adapter, compatibility)
                 with self._state_lock:
                     self._loading = False
+                # The outgoing adapter is retired, not merely unloaded, so a
+                # stray reference can never resurrect a second resident model.
+                if old_adapter is not None and old_adapter is not new_adapter:
+                    try:
+                        old_adapter.retire()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("[models] error retiring previous adapter: %s", exc)
 
             logger.info("[models] package '%s' active — generation=%d", package.id, generation)
             return self.state()
@@ -270,41 +552,25 @@ class ModelManager:
     def bootstrap(self, package_id: str, *, background: bool = True) -> Optional[ActiveState]:
         """Startup activation.
 
-        The package manifest and profile are published synchronously (cheap —
-        JSON only) so that /standards and the UI have data immediately, while
-        the expensive model load runs in the background exactly like the old
-        detector warmup thread did.  ``infer()`` still works during that window
-        because adapters load lazily under their own lock.
+        The manifest and profile are published synchronously (cheap — JSON
+        only) so /standards and the UI have data immediately, while the model
+        load runs in the background exactly like the old detector warmup thread.
+        The background load takes the same lifecycle gate as everything else,
+        so it can never end up loading in parallel with a runtime switch.
 
-        This split is safe only because there is no previously active package
-        at startup.  Runtime switches always go through ``activate()``, which
-        is fully synchronous.
+        Until the load finishes ``ActiveState.ready`` is False and /status
+        reports ``model_loading``, so nothing claims the model is usable yet.
         """
         with self._switch_lock:
             try:
                 package = self._resolve_for_activation(package_id)
-            except ModelManagerError as exc:
+                adapter_cls = get_adapter_class(package.adapter)
+                profile = self._load_profile_for(package)
+            except (ModelManagerError, UnknownAdapterError) as exc:
                 with self._state_lock:
                     self._last_error = str(exc)
                 logger.error("[models] startup package '%s' unusable: %s", package_id, exc)
                 return None
-
-            try:
-                adapter_cls = get_adapter_class(package.adapter)
-            except UnknownAdapterError as exc:
-                with self._state_lock:
-                    self._last_error = str(exc)
-                logger.error("[models] startup package '%s': %s", package_id, exc)
-                return None
-
-            try:
-                profile = load_profile(
-                    package,
-                    self.profiles_dir,
-                    legacy_package_id=self.legacy_package_id,
-                    legacy_standards_path=self.legacy_standards_path,
-                    legacy_unit_weights_path=self.legacy_unit_weights_path,
-                )
             except Exception as exc:  # noqa: BLE001
                 with self._state_lock:
                     self._last_error = str(exc)
@@ -312,7 +578,9 @@ class ModelManager:
                 return None
 
             adapter = adapter_cls(package)
-            generation = self._publish(package, profile, adapter)
+            with self._state_lock:
+                self._loading = True
+            generation = self._publish(package, profile, adapter, {})
             logger.info("[models] startup package '%s' published — generation=%d",
                         package.id, generation)
 
@@ -328,50 +596,91 @@ class ModelManager:
         return self.state()
 
     def _background_load(self, package_id: str, generation: int) -> None:
-        adapter = self.active_adapter
-        if adapter is None or self.generation != generation:
-            return
+        """Load the startup model under the same gate as everything else."""
         try:
-            adapter.load()
-        except Exception as exc:  # noqa: BLE001 - a cold load failure is not fatal here
-            logger.warning("[models] background load of '%s' failed: %s — will retry on "
-                           "first inference", package_id, exc)
+            with self._gate(what="startup load"):
+                # A runtime switch may have overtaken us while we waited for the
+                # gate; loading now would resurrect a package that is no longer
+                # active and put two models in memory.
+                if self.generation != generation:
+                    logger.info("[models] startup load of '%s' superseded by generation %d",
+                                package_id, self.generation)
+                    return
+                adapter = self.active_adapter
+                if adapter is None:
+                    return
+                try:
+                    adapter.load()
+                except Exception as exc:  # noqa: BLE001
+                    message = "startup load of '%s' failed: %s" % (package_id, exc)
+                    logger.error("[models] %s", message)
+                    with self._state_lock:
+                        self._last_error = message
+                        self._fatal_error = message
+                    self._ready_event.clear()
+                    return
+                profile = self.active_profile
+                if profile is not None:
+                    with self._state_lock:
+                        self._compatibility = self._build_compatibility(profile, adapter)
+                # Startup warmup stays lenient — the model already loaded, and a
+                # warmup hiccup must not stop the unit from booting.
+                adapter.warmup(strict=False)
+                self._ready_event.set()
+        finally:
             with self._state_lock:
-                self._last_error = str(exc)
-            return
-        if self.generation != generation:
-            return
-        adapter.warmup()
+                self._loading = False
 
-    # ── inference ─────────────────────────────────────────────────────────
+    # ── profile edits ─────────────────────────────────────────────────────
+
+    def update_active_profile(self, kind: str, values: Dict[str, Any], *,
+                              package_id: Optional[str] = None) -> Dict[str, Any]:
+        """Edit the active package's profile, refusing cross-package writes.
+
+        ``package_id`` is what the client believed was active when it composed
+        the edit.  A debounced standards edit can easily arrive after the
+        operator has already switched packages; without this check the
+        orthopaedic numbers would land in the obstetric profile.
+        """
+        with self._state_lock:
+            active_id = self._package.id if self._package else None
+            if package_id is not None and package_id != active_id:
+                raise PackageMismatchError(package_id, active_id)
+            profile = self._profile
+            if profile is None:
+                raise ModelManagerError("no active model package — cannot edit %s" % kind)
+            if kind == "standards":
+                return profile.update_standards(values)
+            if kind == "unit_weights":
+                return profile.update_unit_weights(values)
+            raise ValueError("unknown profile section %r" % kind)
+
+    # ── inference (legacy convenience) ────────────────────────────────────
 
     def infer(self, image: Any, conf: Optional[float] = None,
               imgsz: Optional[int] = None) -> InferenceResult:
-        """Run inference with the active model.
+        """One-shot inference.
 
-        Returns a result whose ``metadata['generation']`` is the generation the
-        inference actually ran under.  Background workers compare that against
-        the current generation and discard the result if it changed.
+        Prefer ``inference_session()`` whenever the result is going to be
+        published anywhere — this helper pins the package only for the model
+        call itself, not for the publication that follows.
         """
-        state = self.state()
-        if not state.ready or state.adapter is None:
-            raise ModelManagerError(
-                "no active model package (%s)" % (self.last_error or "not configured"))
-        result = state.adapter.infer(image, conf=conf, imgsz=imgsz)
-        result.metadata.setdefault("generation", state.generation)
-        result.metadata.setdefault("package_id", state.package_id)
-        return result
+        with self.inference_session() as session:
+            return session.infer(image, conf=conf, imgsz=imgsz)
 
     # ── introspection ─────────────────────────────────────────────────────
 
     def model_info(self) -> Dict[str, Any]:
         state = self.state()
-        if not state.ready or state.package is None:
+        if not state.configured or state.package is None:
             return {
                 "active": False,
+                "ready": False,
+                "loading": self.loading,
                 "generation": state.generation,
                 "package_id": None,
                 "error": self.last_error,
+                "fatal_error": self.fatal_error,
                 "packages_dir": str(self.packages_dir),
             }
         adapter = state.adapter
@@ -380,23 +689,28 @@ class ModelManager:
         payload = info.to_dict()
         payload.update({
             "active": True,
+            "ready": state.ready,
+            "loading": self.loading,
             "generation": state.generation,
-            "loading": self._loading,
             "package": state.package.summary(),
             "standards_count": len(state.standards),
             "class_weights_count": len(state.class_weights),
+            "compatibility": self.compatibility,
             "error": self.last_error,
+            "fatal_error": self.fatal_error,
         })
         return payload
 
     def shutdown(self) -> None:
-        with self._state_lock:
-            adapter = self._adapter
-            self._adapter = None
-            self._package = None
-            self._profile = None
-        if adapter is not None:
-            try:
-                adapter.unload()
-            except Exception:  # noqa: BLE001
-                pass
+        with self._gate(timeout=10.0, what="shutdown"):
+            with self._state_lock:
+                adapter = self._adapter
+                self._adapter = None
+                self._package = None
+                self._profile = None
+            self._ready_event.clear()
+            if adapter is not None:
+                try:
+                    adapter.retire()
+                except Exception:  # noqa: BLE001
+                    pass

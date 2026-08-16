@@ -16,6 +16,8 @@ let recognitionActive = false;
 let pendingFile       = null;
 let stdDebounce  = null;
 let uwDebounce   = null;
+let stdPendingPackage = null;   // package a pending standards edit belongs to
+let uwPendingPackage  = null;   // package a pending unit-weight edit belongs to
 let donutChart   = null;
 let statusPollTimer          = null;   // the single /status setInterval handle
 let weightPollingActive      = false;
@@ -120,26 +122,70 @@ async function fetchStandards() {
   } catch (e) { console.error('fetchStandards:', e); }
 }
 
+// Edits are debounced, so a keystroke can still be in flight when the operator
+// switches packages.  Each pending edit remembers which package it was typed
+// against, and that identity travels with the request — the backend refuses it
+// with 409 rather than stamping one department's quantities onto another's.
 function scheduleStandardsSync() {
   clearTimeout(stdDebounce);
-  stdDebounce = setTimeout(pushStandards, 300);
+  stdPendingPackage = activePackageId;
+  stdDebounce = setTimeout(() => { stdDebounce = null; pushStandards(stdPendingPackage); }, 300);
 }
 
-async function pushStandards() {
+function collectStandardsInputs() {
   const payload = {};
   document.querySelectorAll('.std-input').forEach(inp => {
     payload[inp.dataset.cls] = parseInt(inp.value) || 0;
   });
+  return payload;
+}
+
+async function pushStandards(packageId) {
+  const payload = collectStandardsInputs();
+  const target = packageId || activePackageId;
   try {
-    await fetch('/standards', {
+    const res = await fetch('/standards', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Model-Package': target || '',
+      },
+      body: JSON.stringify({ package_id: target, values: payload }),
     });
+    if (res.status === 409) {
+      // The package changed under this edit; the write was refused on purpose.
+      console.warn('[standards] rejected — package changed since the edit');
+      await fetchStandards();
+      rerenderTable(lastCounts);
+      refreshWeightVerification();
+      return false;
+    }
     standards = payload;
     rerenderTable(lastCounts);
     refreshWeightVerification();
-  } catch (e) { console.error('pushStandards:', e); }
+    return true;
+  } catch (e) { console.error('pushStandards:', e); return false; }
+}
+
+// Send anything still sitting in a debounce timer, so switching packages never
+// silently discards the operator's last keystroke — nor lets it land on the
+// wrong package.
+async function flushPendingEdits() {
+  const jobs = [];
+  if (stdDebounce !== null) {
+    clearTimeout(stdDebounce);
+    stdDebounce = null;
+    jobs.push(pushStandards(stdPendingPackage));
+  }
+  if (uwDebounce !== null) {
+    clearTimeout(uwDebounce);
+    uwDebounce = null;
+    jobs.push(pushUnitWeights(uwPendingPackage));
+  }
+  if (jobs.length) {
+    console.debug('[edits] flushing ' + jobs.length + ' pending edit(s) before switch');
+    await Promise.all(jobs);
+  }
 }
 
 // ── Unit weights ──────────────────────────────────────────────────────────
@@ -208,6 +254,10 @@ async function onPackageChange(evt) {
   sel.disabled = true;
   setPackageStatus('切換中…', 'busy');
   try {
+    // Send any debounced edit first, tagged with the package it was typed
+    // against, so the operator's last keystroke is neither lost nor misapplied.
+    await flushPendingEdits();
+
     const res  = await fetch('/api/model-package', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -217,28 +267,32 @@ async function onPackageChange(evt) {
     if (data.ok) {
       // The switch already completed on the server, so everything derived from
       // the old package must be dropped before the next poll paints it again.
-      await applyPackageSwitch(targetId);
-      setPackageStatus('已切換', 'ok');
+      await applyPackageSwitch(targetId, data);
+      setPackageStatus(data.recognition_resumed ? '已切換 · 辨識中' : '已切換', 'ok');
       setTimeout(() => setPackageStatus('', ''), 3000);
     } else {
       alert('切換器械套件失敗：' + (data.error || '未知錯誤'));
       sel.value = previous || '';
       setPackageStatus('切換失敗', 'error');
+      // The backend rolled the old model back and may have resumed
+      // recognition; resync rather than assuming anything.
+      await syncRuntimeState(data);
     }
   } catch (e) {
     alert('連線錯誤：' + e.message);
     sel.value = previous || '';
     setPackageStatus('連線錯誤', 'error');
+    await syncRuntimeState(null);
   } finally {
     sel.disabled = false;
   }
 }
 
-async function applyPackageSwitch(newId) {
+async function applyPackageSwitch(newId, response) {
   activePackageId = newId;
-  stopWeightPolling('package-switched');
-  recognitionActive      = false;
-  recognitionStopPending = false;
+  // Any pending edit now belongs to a package that is no longer active.
+  clearTimeout(stdDebounce); stdDebounce = null;
+  clearTimeout(uwDebounce);  uwDebounce  = null;
   lastCounts = {};
   rerenderTable({});
   setUpdateTime('');
@@ -247,28 +301,72 @@ async function applyPackageSwitch(newId) {
   await fetchUnitWeights();
   await fetchClassWeights();
   await loadPackages();
+  await syncRuntimeState(response);
+}
+
+// Camera and recognition state come from the backend, never from an assumption.
+// The backend decides whether recognition was resumed after a switch, so the UI
+// must read that rather than hard-coding "recognition is now off".
+async function syncRuntimeState(response) {
+  let camRunning = null;
+  let recRunning = null;
+
+  if (response && typeof response.camera_running === 'boolean') {
+    camRunning = response.camera_running;
+    recRunning = response.recognition_resumed === true;
+  } else {
+    try {
+      const d = await (await fetch('/camera/status')).json();
+      camRunning = d.running === true && d.stopping !== true;
+      recRunning = d.recognition_running === true && d.stopping !== true;
+    } catch (e) {
+      console.warn('[sync] /camera/status failed:', e.message);
+      return;
+    }
+  }
+
+  cameraActive           = camRunning;
+  recognitionActive      = recRunning;
+  recognitionStopPending = false;
+  cameraStopPending      = false;
+  console.debug('[sync] camera=' + camRunning + ' recognition=' + recRunning);
+
+  if (recRunning) startWeightPolling('runtime-state-sync');
+  else stopWeightPolling('runtime-state-sync');
   syncCameraUI();
 }
 
 function scheduleUnitWeightsSync() {
   clearTimeout(uwDebounce);
-  uwDebounce = setTimeout(pushUnitWeights, 300);
+  uwPendingPackage = activePackageId;
+  uwDebounce = setTimeout(() => { uwDebounce = null; pushUnitWeights(uwPendingPackage); }, 300);
 }
 
-async function pushUnitWeights() {
+async function pushUnitWeights(packageId) {
   const payload = {};
   document.querySelectorAll('.uw-input').forEach(inp => {
     payload[inp.dataset.cls] = parseFloat(inp.value) || 0;
   });
+  const target = packageId || activePackageId;
   try {
-    await fetch('/unit_weights', {
+    const res = await fetch('/unit_weights', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Model-Package': target || '',
+      },
+      body: JSON.stringify({ package_id: target, values: payload }),
     });
+    if (res.status === 409) {
+      console.warn('[unit_weights] rejected — package changed since the edit');
+      await fetchUnitWeights();
+      refreshWeightVerification();
+      return false;
+    }
     unitWeights = payload;
     refreshWeightVerification();
-  } catch (e) { console.error('pushUnitWeights:', e); }
+    return true;
+  } catch (e) { console.error('pushUnitWeights:', e); return false; }
 }
 
 // ── Weight verification display ───────────────────────────────────────────
@@ -281,6 +379,14 @@ const WEIGHT_STATE_LABEL = {
   no_standard_weight: '不明',
   passed:             '符合',
   failed:             '不符合',
+};
+
+const WEIGHT_STATE_MESSAGE = {
+  waiting_weight:     '等待重量讀值',
+  stabilizing:        '重量穩定中',
+  no_standard_weight: '尚未設定標準重量',
+  passed:             '重量在容許範圍內',
+  failed:             '重量超出容許範圍',
 };
 
 function weightStateClass(state) {
@@ -358,12 +464,15 @@ function recalculateExpectedAndRender(source) {
 
   let expected = 0;
   const debugParts = [];
+  const missingWeights = [];
   Object.entries(standards).forEach(([cls, std]) => {
     const qty = Number(std);   // Number("0")=0  Number("")=0  Number(undefined)=NaN
-    if (!Number.isFinite(qty) || qty === 0) return;   // 0 contributes nothing; NaN is invalid
+    if (!Number.isFinite(qty) || qty <= 0) return;   // 0 contributes nothing; NaN is invalid
     const uw = Number(classWeights[cls]);
-    if (!Number.isFinite(uw)) {
-      console.warn('[wv] class "' + cls + '" not in classWeights — 0 g');
+    if (!Number.isFinite(uw) || uw <= 0) {
+      // NOT treated as 0 g: skipping it would lower the expected total, which
+      // is exactly the direction that lets an incomplete tray pass.
+      missingWeights.push(cls);
       return;
     }
     expected += qty * uw;
@@ -379,7 +488,14 @@ function recalculateExpectedAndRender(source) {
   const stable = _lastKnownWV.stable !== false;
 
   let state, diff = null, passed = null, ready = false;
-  if (actual == null || !fresh) {
+  if (missingWeights.length) {
+    // A configuration fault, not a measurement state: the expected total is
+    // wrong until every expected instrument has a unit weight.
+    state = 'no_standard_weight';
+    _lastKnownWV.message = '標準重量未完整設定：缺少 '
+      + missingWeights.slice(0, 5).join('、')
+      + (missingWeights.length > 5 ? '…' : '') + ' 的單重';
+  } else if (actual == null || !fresh) {
     state = 'waiting_weight';
   } else if (!stable) {
     state = 'stabilizing';
@@ -395,11 +511,15 @@ function recalculateExpectedAndRender(source) {
   }
 
   // Patch _lastKnownWV so any subsequent call sees the fresh expected value.
-  _lastKnownWV.expected   = expected;
-  _lastKnownWV.difference = diff;
-  _lastKnownWV.passed     = passed;
-  _lastKnownWV.ready      = ready;
-  _lastKnownWV.state      = state;
+  _lastKnownWV.expected              = expected;
+  _lastKnownWV.difference            = diff;
+  _lastKnownWV.passed                = passed;
+  _lastKnownWV.ready                 = ready;
+  _lastKnownWV.state                 = state;
+  _lastKnownWV.missing_class_weights = missingWeights;
+  if (!missingWeights.length) {
+    _lastKnownWV.message = WEIGHT_STATE_MESSAGE[state] || '';
+  }
 
   console.debug('[wv] recalc source=' + source
     + ' expected=' + expected.toFixed(1)
@@ -416,21 +536,39 @@ function recalculateExpectedAndRender(source) {
 let _lastKnownWV = null;
 
 // ── Results table ─────────────────────────────────────────────────────────
+// Rows are the UNION of expected instruments and detected ones.  Iterating only
+// what the model saw is how an instrument that was missed entirely disappears
+// from the table instead of being reported 缺少 — the single most important row
+// in an inventory system.
 function rerenderTable(counts) {
   lastCounts = counts || {};
   const tbody = document.getElementById('results-tbody');
 
-  if (Object.keys(lastCounts).length === 0) {
+  const allClasses = new Set(
+    Object.keys(standards).concat(Object.keys(lastCounts))
+  );
+
+  const rowsData = [];
+  allClasses.forEach(cls => {
+    const cnt = Number(lastCounts[cls]) || 0;
+    const std = Number(standards[cls]) || 0;
+    // A class with no expectation and no detection is auto-registration noise.
+    if (cnt === 0 && std === 0) return;
+    rowsData.push({ cls, cnt, std });
+  });
+
+  if (rowsData.length === 0) {
     tbody.innerHTML = '<tr><td colspan="4" class="empty-row">尚無辨識結果</td></tr>';
     updateChart(0, 0, 0);
     return;
   }
 
+  rowsData.sort((a, b) => (a.cls < b.cls ? -1 : a.cls > b.cls ? 1 : 0));
+
   let normal = 0, missing = 0, extra = 0;
   let rows = '';
 
-  Object.entries(lastCounts).sort().forEach(([cls, cnt]) => {
-    const std = standards[cls] !== undefined ? standards[cls] : 0;
+  rowsData.forEach(({ cls, cnt, std }) => {
     let badge = '';
     if (cnt === std)    { badge = '<span class="badge badge-normal">正常</span>';  normal++;  }
     else if (cnt < std) { badge = '<span class="badge badge-missing">缺少</span>'; missing++; }
@@ -662,8 +800,11 @@ async function pollStatus() {
     // This prevents a late inference result from updating the UI after the user stopped.
     // When camera is off (upload mode), always render.
     const shouldRenderCounts = !cameraActive || (recognitionActive && !recognitionStopPending);
-    if (shouldRenderCounts && data.counts && Object.keys(data.counts).length > 0) {
-      rerenderTable(data.counts);
+    // Keyed on timestamp, not on counts being non-empty: a recognition that
+    // detected nothing at all is a real result — and the one where every
+    // expected instrument must show as 缺少.
+    if (shouldRenderCounts && data.timestamp) {
+      rerenderTable(data.counts || {});
       setUpdateTime(data.timestamp);
     }
 

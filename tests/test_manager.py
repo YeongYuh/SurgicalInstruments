@@ -120,7 +120,7 @@ def test_failed_switch_keeps_previous_package_serving(tmp_path):
 
     with pytest.raises(ModelManagerError) as excinfo:
         manager.activate("broken_load")
-    assert "failed to load model" in str(excinfo.value)
+    assert "failed to activate package" in str(excinfo.value)
 
     state = manager.state()
     assert state.package_id == "ortho"           # still the old package
@@ -204,7 +204,8 @@ def test_legacy_global_standards_seed_only_the_legacy_package(tmp_path):
 
 def test_class_weights_come_from_the_active_package(tmp_path):
     manager = make_manager(tmp_path)
-    write_package(_packages_dir(manager), "ortho", class_weights={"widget": 10.0})
+    write_package(_packages_dir(manager), "ortho", class_weights={"widget": 10.0},
+                  standards={"widget": 1})
     write_package(_packages_dir(manager), "obgyn", class_weights={"forceps": 7.5},
                   standards={"forceps": 1})
 
@@ -218,7 +219,8 @@ def test_class_weights_come_from_the_active_package(tmp_path):
 
 def test_class_weights_are_not_editable_through_the_profile(tmp_path):
     manager = make_manager(tmp_path)
-    write_package(_packages_dir(manager), "ortho", class_weights={"widget": 10.0})
+    write_package(_packages_dir(manager), "ortho", class_weights={"widget": 10.0},
+                  standards={"widget": 1})
     manager.activate("ortho")
 
     weights = manager.state().class_weights
