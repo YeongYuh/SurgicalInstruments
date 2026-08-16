@@ -20,7 +20,6 @@ let stdPendingPackage = null;   // package a pending standards edit belongs to
 let uwPendingPackage  = null;   // package a pending unit-weight edit belongs to
 let stdInFlight       = null;   // promise for a standards POST already on the wire
 let uwInFlight        = null;   // promise for a unit-weight POST already on the wire
-let donutChart   = null;
 let statusPollTimer          = null;   // the single /status setInterval handle
 let weightPollingActive      = false;
 let weightPollToken          = 0;
@@ -37,6 +36,10 @@ let availablePackages       = [];     // /api/model-packages payload
 let activePreset            = null;   // selected surgery preset, if the package has any
 let availablePresets        = [];     // /api/inventory-presets payload
 let presetModified          = false;  // standards hand-edited away from the preset
+// Whether the numbers on screen came from an inference for the ACTIVE package.
+// "No recognition yet" and "recognised, found nothing" must never both render
+// as an empty table with a 盤點符合 verdict attached.
+let hasCurrentResult        = false;
 
 // ── Init ──────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', async () => {
@@ -46,7 +49,6 @@ window.addEventListener('DOMContentLoaded', async () => {
   }
   appInitialized = true;
   console.debug('[init] app start CLIENT_ID=' + CLIENT_ID);
-  initChart();
   await loadPackages();
   await loadPresets();
   await fetchStandards();
@@ -84,40 +86,63 @@ async function initCameraState() {
   }
 }
 
-// ── Chart.js donut ────────────────────────────────────────────────────────
-function initChart() {
-  const ctx = document.getElementById('donut-chart').getContext('2d');
-  donutChart = new Chart(ctx, {
-    type: 'doughnut',
-    data: {
-      labels: ['正常', '缺少', '多出'],
-      datasets: [{
-        data: [0, 0, 0],
-        backgroundColor: ['#4caf50', '#f44336', '#ff9800'],
-        borderWidth: 0,
-        hoverOffset: 4,
-      }]
-    },
-    options: {
-      responsive: false,
-      cutout: '60%',
-      plugins: { legend: { display: false } },
-      animation: { duration: 300 },
+// ── Inventory model ───────────────────────────────────────────────────────
+// One pure function turns counts + standards into everything the UI shows, so
+// the hero verdict, the summary cards and the table can never disagree.
+//
+// UNITS are the headline number, not classes: "缺少 2 支" is what the operator
+// has to go and find. "缺少 1 類" hides that two Towel-Clamps are missing.
+function calculateInventorySummary(counts, standardsMap) {
+  counts = counts || {};
+  standardsMap = standardsMap || {};
+
+  const names = new Set(Object.keys(standardsMap).concat(Object.keys(counts)));
+  const rows = [];
+  let missingUnits = 0, extraUnits = 0, expectedUnits = 0, detectedUnits = 0;
+
+  names.forEach(cls => {
+    const detected = Number(counts[cls]) || 0;
+    const standard = Number(standardsMap[cls]) || 0;
+    // Neither expected nor seen: auto-registered noise, not part of this tray.
+    if (detected === 0 && standard === 0) return;
+
+    expectedUnits += standard;
+    detectedUnits += detected;
+
+    let status = 'normal';
+    let delta = 0;
+    if (detected < standard) {
+      status = 'missing';
+      delta = standard - detected;
+      missingUnits += delta;
+    } else if (detected > standard) {
+      status = 'extra';
+      delta = detected - standard;
+      extraUnits += delta;
     }
+    rows.push({ cls, detected, standard, status, delta });
   });
+
+  const order = { missing: 0, extra: 1, normal: 2 };
+  rows.sort((a, b) => (order[a.status] - order[b.status])
+    || (a.cls < b.cls ? -1 : a.cls > b.cls ? 1 : 0));
+
+  const byStatus = st => rows.filter(r => r.status === st);
+  return {
+    rows,
+    missingRows: byStatus('missing'),
+    extraRows: byStatus('extra'),
+    normalRows: byStatus('normal'),
+    missingClasses: byStatus('missing').length,
+    extraClasses: byStatus('extra').length,
+    normalClasses: byStatus('normal').length,
+    missingUnits, extraUnits, expectedUnits, detectedUnits,
+  };
 }
 
-function updateChart(normal, missing, extra) {
-  if (!donutChart) return;
-  const total = normal + missing + extra;
-  donutChart.data.datasets[0].data = total > 0 ? [normal, missing, extra] : [1, 0, 0];
-  donutChart.data.datasets[0].backgroundColor = total > 0
-    ? ['#4caf50', '#f44336', '#ff9800']
-    : ['#2d3448', '#2d3448', '#2d3448'];
-  donutChart.update('none');
-  document.getElementById('cnt-normal').textContent  = normal;
-  document.getElementById('cnt-missing').textContent = missing;
-  document.getElementById('cnt-extra').textContent   = extra;
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
 // ── Standards ─────────────────────────────────────────────────────────────
@@ -136,6 +161,41 @@ function scheduleStandardsSync() {
   clearTimeout(stdDebounce);
   stdPendingPackage = activePackageId;
   stdDebounce = setTimeout(() => { stdDebounce = null; pushStandards(stdPendingPackage); }, 300);
+}
+
+// A hand-edited standard must change the verdict NOW, not at the next
+// inference: the operator is typing "2" precisely to find out whether the tray
+// is short.  The row itself is patched in place rather than re-rendered, so the
+// caret does not jump out of the input mid-keystroke.
+function onStandardEdit(input) {
+  const cls = input.dataset.cls;
+  if (cls) standards[cls] = parseInt(input.value) || 0;
+
+  const summary = calculateInventorySummary(lastCounts, standards);
+  _lastSummary = summary;
+  renderSummaryCards(summary);
+  renderOverallStatus();
+
+  const row = summary.rows.find(r => r.cls === cls);
+  const tr  = input.closest('tr');
+  if (row && tr) {
+    const badge = tr.querySelector('td:last-child');
+    if (badge) {
+      if (row.status === 'missing') {
+        badge.innerHTML = `<span class="badge badge-missing">缺少 ${row.delta} 支</span>`;
+      } else if (row.status === 'extra') {
+        badge.innerHTML = `<span class="badge badge-extra">多出 ${row.delta} 支</span>`;
+      } else {
+        badge.innerHTML = '<span class="badge badge-normal">正常</span>';
+      }
+    }
+    tr.classList.remove('row-missing', 'row-extra', 'row-normal');
+    tr.classList.add('row-' + row.status);
+  }
+
+  // Expected weight is standards × class_weights, so it moves with the edit too.
+  refreshWeightVerification();
+  scheduleStandardsSync();
 }
 
 function collectStandardsInputs() {
@@ -305,42 +365,48 @@ async function loadPresets() {
 }
 
 function renderPresetSelect() {
-  const group  = document.getElementById('preset-group');
+  const bar    = document.getElementById('surgery-bar');
   const select = document.getElementById('preset-select');
-  const weight = document.getElementById('preset-weight');
-  if (!group || !select) return;
+  const meta   = document.getElementById('preset-meta');
+  if (!bar || !select) return;
 
   // Packages with one fixed tray get no control at all, rather than a dead one.
   if (!availablePresets.length) {
-    group.style.display = 'none';
+    bar.style.display = 'none';
     select.innerHTML = '';
-    if (weight) weight.textContent = '';
+    if (meta) meta.textContent = '';
+    renderOverallStatus();
     return;
   }
 
-  group.style.display = 'flex';
-  select.innerHTML = availablePresets.map(p => {
-    const selected = p.id === activePreset ? ' selected' : '';
-    return `<option value="${p.id}"${selected}>${p.display_name}</option>`;
-  }).join('');
-  if (activePreset === null) select.selectedIndex = -1;
+  bar.style.display = 'flex';
+  select.innerHTML = '<option value="" disabled>請選擇手術類型</option>'
+    + availablePresets.map(p => {
+      const selected = p.id === activePreset ? ' selected' : '';
+      return `<option value="${p.id}"${selected}>${escapeHtml(p.display_name)}</option>`;
+    }).join('');
+  if (activePreset === null) select.value = '';
+  // Nothing chosen yet is a state the operator must resolve before any number
+  // on screen means anything — make the control itself say so.
+  select.classList.toggle('unset', activePreset === null);
 
-  if (weight) {
+  if (meta) {
     const current = availablePresets.find(p => p.id === activePreset);
     if (!current) {
-      weight.textContent = '尚未選擇';
-      weight.className = '';
+      meta.textContent = '';
+      meta.className = '';
     } else if (presetModified) {
       // The operator hand-edited the table; say so instead of showing a factory
       // total that no longer matches what is expected.
-      weight.textContent = `${current.display_name}（已修改）`;
-      weight.className = 'modified';
+      meta.textContent = '已修改';
+      meta.className = 'modified';
     } else {
-      weight.textContent = `標準重量 ${current.expected_weight.toFixed(0)} g`
-        + `  ·  ${current.instrument_count} 支`;
-      weight.className = '';
+      meta.textContent = `${current.instrument_count} 支 · `
+        + `${current.expected_weight.toFixed(0)} g`;
+      meta.className = '';
     }
   }
+  renderOverallStatus();
 }
 
 async function onPresetChange(evt) {
@@ -387,6 +453,7 @@ async function onPresetChange(evt) {
     // The counts were produced for the previous tray; the backend has already
     // invalidated them, so drop what is on screen too.
     lastCounts = {};
+    hasCurrentResult = false;
     rerenderTable({});
     setUpdateTime('');
     resetWeightDisplay();
@@ -468,6 +535,7 @@ async function applyPackageSwitch(newId, response) {
   clearTimeout(stdDebounce); stdDebounce = null;
   clearTimeout(uwDebounce);  uwDebounce  = null;
   lastCounts = {};
+  hasCurrentResult = false;
   rerenderTable({});
   setUpdateTime('');
   resetWeightDisplay();
@@ -575,10 +643,18 @@ async function pushUnitWeights(packageId) {
 // inventory, and painting it red teaches operators to ignore red.
 const WEIGHT_STATE_LABEL = {
   waiting_weight:     '等待重量',
-  stabilizing:        '量測中',
-  no_standard_weight: '不明',
-  passed:             '符合',
-  failed:             '不符合',
+  stabilizing:        '重量穩定中',
+  no_standard_weight: '標準重量未設定',
+  passed:             '重量符合',
+  failed:             '重量不符合',
+};
+
+const WEIGHT_STATE_ICON = {
+  waiting_weight:     '…',
+  stabilizing:        '◔',
+  no_standard_weight: '?',
+  passed:             '✓',
+  failed:             '✕',
 };
 
 const WEIGHT_STATE_MESSAGE = {
@@ -590,43 +666,63 @@ const WEIGHT_STATE_MESSAGE = {
 };
 
 function weightStateClass(state) {
-  if (state === 'passed')      return 'stat-box weight-ok-box passed';
-  if (state === 'failed')      return 'stat-box weight-ok-box failed';
-  if (state === 'stabilizing') return 'stat-box weight-ok-box measuring';
-  return 'stat-box weight-ok-box waiting';
+  if (state === 'passed')      return 'wt-passed';
+  if (state === 'failed')      return 'wt-failed';
+  if (state === 'stabilizing') return 'wt-stabilizing';
+  return 'wt-waiting';
+}
+
+function grams(value) {
+  return (value == null || !Number.isFinite(Number(value)))
+    ? '—' : Number(value).toFixed(1) + ' g';
 }
 
 function renderWeightVerification(wv) {
   if (!wv) return;
+  const state = wv.state || 'waiting_weight';
+  const card    = document.getElementById('weight-card');
+  const icon    = document.getElementById('weight-icon');
+  const title   = document.getElementById('weight-title');
+  const numbers = document.getElementById('weight-numbers');
+  const diff    = document.getElementById('weight-diff');
+  if (!card) return;
 
-  // Row-2 stat boxes in 盤點統計
-  const expWtEl  = document.getElementById('stat-exp-wt');
-  const actWtEl  = document.getElementById('stat-act-wt');
-  const wokEl    = document.getElementById('stat-wt-ok');
-  const wokBox   = document.getElementById('stat-wt-ok-box');
-  if (expWtEl) expWtEl.textContent = wv.expected != null ? `${wv.expected.toFixed(1)} g` : '—';
-  if (actWtEl) {
-    if (wv.actual == null) {
-      actWtEl.textContent = '未量測';
-    } else if (wv.fresh === false) {
-      // Show the last number but mark it as no longer live, so a cached value
-      // from before the cable was pulled cannot pass for a current reading.
-      actWtEl.textContent = `${wv.actual.toFixed(1)} g (逾時)`;
+  card.className = weightStateClass(state);
+  if (icon)  icon.textContent  = WEIGHT_STATE_ICON[state] || '…';
+  if (title) title.textContent = WEIGHT_STATE_LABEL[state] || '重量';
+
+  if (numbers) {
+    if (state === 'no_standard_weight') {
+      const missing = wv.missing_class_weights || [];
+      numbers.textContent = missing.length
+        ? '缺少單重：' + missing.slice(0, 3).join('、') + (missing.length > 3 ? '…' : '')
+        : '尚未設定標準重量';
+    } else if (wv.actual == null) {
+      numbers.textContent = '標準 ' + grams(wv.expected);
     } else {
-      actWtEl.textContent = `${wv.actual.toFixed(1)} g`;
+      // A cached value from before the cable was pulled must not read as live.
+      const stale = wv.fresh === false ? '（逾時）' : '';
+      numbers.textContent = '實際 ' + grams(wv.actual) + stale
+        + '　標準 ' + grams(wv.expected);
     }
   }
-  if (wokEl && wokBox) {
-    const state = wv.state || 'waiting_weight';
-    console.debug(
-      '[wv] state=' + state + ' actual=' + wv.actual + ' expected=' + wv.expected
-      + ' tolerance=' + wv.tolerance + ' passed=' + wv.passed
-      + ' stable=' + wv.stable + ' fresh=' + wv.fresh,
-    );
-    wokEl.textContent = WEIGHT_STATE_LABEL[state] || '—';
-    wokBox.className  = weightStateClass(state);
-    wokBox.title      = wv.message || '';
+
+  if (diff) {
+    if (wv.actual != null && wv.expected != null && state !== 'no_standard_weight') {
+      const delta = Number(wv.actual) - Number(wv.expected);
+      const sign  = delta > 0 ? '+' : '';
+      diff.textContent = '差異 ' + sign + delta.toFixed(1) + ' g'
+        + (wv.tolerance != null ? '（容許 ±' + Number(wv.tolerance).toFixed(1) + ' g）' : '');
+    } else {
+      diff.textContent = '';
+    }
   }
+
+  console.debug('[wv] state=' + state + ' actual=' + wv.actual
+    + ' expected=' + wv.expected + ' passed=' + wv.passed
+    + ' stable=' + wv.stable + ' fresh=' + wv.fresh);
+
+  renderOverallStatus();
 }
 
 // Copy only the fields the backend owns (scale reading + gate) into the cached
@@ -740,51 +836,189 @@ let _lastKnownWV = null;
 // what the model saw is how an instrument that was missed entirely disappears
 // from the table instead of being reported 缺少 — the single most important row
 // in an inventory system.
+//
+// Order is missing → extra → normal, because at 600 px high the operator should
+// never have to scroll to find out what is wrong.  Normal rows are folded away
+// by default for the same reason.
+let normalRowsCollapsed = true;   // frontend-only; not persisted
+let _lastSummary = null;
+
 function rerenderTable(counts) {
   lastCounts = counts || {};
+  const summary = calculateInventorySummary(lastCounts, standards);
+  _lastSummary = summary;
+  renderInventoryRows(summary);
+  renderSummaryCards(summary);
+  renderOverallStatus();
+}
+
+function toggleNormalRows() {
+  normalRowsCollapsed = !normalRowsCollapsed;
+  if (_lastSummary) renderInventoryRows(_lastSummary);
+}
+
+function countCell(row) {
+  // detected / [editable standard] — the operator never has to do the
+  // subtraction themselves, and the standard stays editable.
+  return `<td class="cls-count">`
+    + `<span class="detected-num">${row.detected}</span>`
+    + `<span class="count-sep">/</span>`
+    + `<input type="number" min="0" step="1" class="std-input" data-cls="${escapeHtml(row.cls)}"`
+    + ` value="${row.standard}" oninput="onStandardEdit(this)"></td>`;
+}
+
+function inventoryRow(row) {
+  const name = escapeHtml(row.cls);
+  let badge, cssClass;
+  if (row.status === 'missing') {
+    badge = `<span class="badge badge-missing">缺少 ${row.delta} 支</span>`;
+    cssClass = 'row-missing';
+  } else if (row.status === 'extra') {
+    badge = `<span class="badge badge-extra">多出 ${row.delta} 支</span>`;
+    cssClass = 'row-extra';
+  } else {
+    badge = '<span class="badge badge-normal">正常</span>';
+    cssClass = 'row-normal' + (normalRowsCollapsed ? ' collapsed' : '');
+  }
+  return `<tr class="${cssClass}">`
+    + `<td class="cls-name" title="${name}">${name}</td>`
+    + countCell(row)
+    + `<td>${badge}</td></tr>`;
+}
+
+function groupRow(cssClass, label, onclick) {
+  const handler = onclick ? ` onclick="${onclick}"` : '';
+  return `<tr class="group-row ${cssClass}"${handler}><td colspan="3">${label}</td></tr>`;
+}
+
+function renderInventoryRows(summary) {
   const tbody = document.getElementById('results-tbody');
+  if (!tbody) return;
 
-  const allClasses = new Set(
-    Object.keys(standards).concat(Object.keys(lastCounts))
-  );
-
-  const rowsData = [];
-  allClasses.forEach(cls => {
-    const cnt = Number(lastCounts[cls]) || 0;
-    const std = Number(standards[cls]) || 0;
-    // A class with no expectation and no detection is auto-registration noise.
-    if (cnt === 0 && std === 0) return;
-    rowsData.push({ cls, cnt, std });
-  });
-
-  if (rowsData.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="4" class="empty-row">尚無辨識結果</td></tr>';
-    updateChart(0, 0, 0);
+  if (!summary.rows.length) {
+    tbody.innerHTML = '<tr><td colspan="3" class="empty-row">尚無辨識結果</td></tr>';
     return;
   }
 
-  rowsData.sort((a, b) => (a.cls < b.cls ? -1 : a.cls > b.cls ? 1 : 0));
+  let html = '';
+  if (summary.missingRows.length) {
+    html += groupRow('group-missing',
+      `✕ 缺少 ${summary.missingUnits} 支 · ${summary.missingClasses} 類`);
+    summary.missingRows.forEach(r => { html += inventoryRow(r); });
+  }
+  if (summary.extraRows.length) {
+    html += groupRow('group-extra',
+      `! 多出 ${summary.extraUnits} 支 · ${summary.extraClasses} 類`);
+    summary.extraRows.forEach(r => { html += inventoryRow(r); });
+  }
+  if (summary.normalRows.length) {
+    const normalUnits = summary.normalRows.reduce((n, r) => n + r.detected, 0);
+    html += groupRow('group-normal',
+      `✓ 正常 ${summary.normalClasses} 類 / ${normalUnits} 支`
+      + `　<span class="fold-hint">[${normalRowsCollapsed ? '展開' : '收合'}]</span>`,
+      'toggleNormalRows()');
+    summary.normalRows.forEach(r => { html += inventoryRow(r); });
+  }
+  tbody.innerHTML = html;
+}
 
-  let normal = 0, missing = 0, extra = 0;
-  let rows = '';
+function renderSummaryCards(summary) {
+  const set = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+  };
+  set('sum-missing-units', summary.missingUnits);
+  set('sum-missing-classes', summary.missingClasses + ' 類');
+  set('sum-extra-units', summary.extraUnits);
+  set('sum-extra-classes', summary.extraClasses + ' 類');
+  set('sum-normal-classes', summary.normalClasses);
 
-  rowsData.forEach(({ cls, cnt, std }) => {
-    let badge = '';
-    if (cnt === std)    { badge = '<span class="badge badge-normal">正常</span>';  normal++;  }
-    else if (cnt < std) { badge = '<span class="badge badge-missing">缺少</span>'; missing++; }
-    else                { badge = '<span class="badge badge-extra">多出</span>';   extra++;   }
+  // Only light the card up when there is something to act on; a permanently
+  // red "缺少 0" trains the operator to ignore red.
+  const missingCard = document.getElementById('sum-missing');
+  if (missingCard) missingCard.classList.toggle('active', summary.missingUnits > 0);
+  const extraCard = document.getElementById('sum-extra');
+  if (extraCard) extraCard.classList.toggle('active', summary.extraUnits > 0);
+}
 
-    rows += `<tr>
-      <td>${cls}</td>
-      <td>${cnt}</td>
-      <td><input type="number" min="0" step="1" class="std-input" data-cls="${cls}"
-           value="${std}" oninput="scheduleStandardsSync()"></td>
-      <td>${badge}</td>
-    </tr>`;
+// ── Overall verdict ───────────────────────────────────────────────────────
+// Strict precedence, worst first.  The hero must never say 盤點符合 while the
+// table shows a missing instrument, and it must never claim a verdict at all
+// before there is something to judge.
+function overallStatus(summary, wv, opts) {
+  opts = opts || {};
+  if (opts.needsPreset) {
+    return { cls: 'hero-warn', icon: '▾', title: '請選擇手術類型',
+             detail: '未選擇手術類型前，標準數量與重量皆無意義' };
+  }
+  if (!opts.hasResult) {
+    return { cls: 'hero-idle', icon: '…', title: '尚未辨識',
+             detail: '請上傳圖片或開始辨識' };
+  }
+
+  const miss  = summary ? summary.missingUnits : 0;
+  const extra = summary ? summary.extraUnits : 0;
+  if (miss > 0 && extra > 0) {
+    return { cls: 'hero-fail', icon: '✕', title: '盤點異常',
+             detail: `缺少 ${miss} 支、多出 ${extra} 支` };
+  }
+  if (miss > 0) {
+    return { cls: 'hero-fail', icon: '✕', title: '器械缺少',
+             detail: `缺少 ${miss} 支 · ${summary.missingClasses} 類` };
+  }
+  if (extra > 0) {
+    return { cls: 'hero-warn', icon: '!', title: '器械多出',
+             detail: `多出 ${extra} 支 · ${summary.extraClasses} 類` };
+  }
+
+  // Counts are clean — the weight check is the only thing left that can fail.
+  const state = wv && wv.state ? wv.state : 'waiting_weight';
+  if (state === 'no_standard_weight') {
+    return { cls: 'hero-warn', icon: '?', title: '標準重量未設定',
+             detail: '數量相符，但無法核對重量' };
+  }
+  if (state === 'waiting_weight') {
+    return { cls: 'hero-warn', icon: '…', title: '等待重量',
+             detail: '數量相符，請將器械置於磅秤上' };
+  }
+  if (state === 'stabilizing') {
+    return { cls: 'hero-warn', icon: '◔', title: '重量穩定中',
+             detail: '數量相符，重量量測中' };
+  }
+  if (state === 'failed') {
+    const d = (wv && wv.difference != null)
+      ? `差異 ${Number(wv.difference) > 0 ? '+' : ''}${Number(wv.difference).toFixed(1)} g`
+      : '重量超出容許範圍';
+    return { cls: 'hero-fail', icon: '✕', title: '重量不符合',
+             detail: `數量相符，但${d}` };
+  }
+  // PASS is the one verdict that must be earned, not defaulted into: it needs a
+  // weight check that actually completed AND passed.  Any other state above has
+  // already returned, so an unrecognised state falls through to 等待重量 here
+  // rather than being rendered as a green tick.
+  if (state === 'passed' && wv && wv.ready === true && wv.passed === true) {
+    const n = summary ? summary.detectedUnits : 0;
+    return { cls: 'hero-pass', icon: '✓', title: '盤點符合',
+             detail: `${n} / ${n} 支 · 重量符合` };
+  }
+  return { cls: 'hero-warn', icon: '…', title: '等待重量',
+           detail: '數量相符，等待重量核對' };
+}
+
+function renderOverallStatus() {
+  const hero = document.getElementById('hero');
+  if (!hero) return;
+  const st = overallStatus(_lastSummary, _lastKnownWV, {
+    needsPreset: availablePresets.length > 0 && activePreset === null,
+    hasResult: hasCurrentResult,
   });
-
-  tbody.innerHTML = rows;
-  updateChart(normal, missing, extra);
+  hero.className = st.cls;
+  const icon   = document.getElementById('hero-icon');
+  const title  = document.getElementById('hero-title');
+  const detail = document.getElementById('hero-detail');
+  if (icon)   icon.textContent   = st.icon;
+  if (title)  title.textContent  = st.title;
+  if (detail) detail.textContent = st.detail;
 }
 
 // ── Display helpers ───────────────────────────────────────────────────────
@@ -923,8 +1157,9 @@ async function pollStatus() {
     if (data.result_stale) {
       console.debug('[poll] result is stale (package '
         + data.result_package_id + ' gen ' + data.result_model_generation + ')');
-      if (Object.keys(lastCounts).length) {
+      if (hasCurrentResult || Object.keys(lastCounts).length) {
         lastCounts = {};
+        hasCurrentResult = false;
         rerenderTable({});
         setUpdateTime('');
         resetWeightDisplay();
@@ -1017,6 +1252,7 @@ async function pollStatus() {
     // detected nothing at all is a real result — and the one where every
     // expected instrument must show as 缺少.
     if (shouldRenderCounts && data.timestamp) {
+      hasCurrentResult = data.has_result === true;
       rerenderTable(data.counts || {});
       setUpdateTime(data.timestamp);
     }
@@ -1096,15 +1332,10 @@ function stopWeightPolling(reason = '') {
 
 // Show "未量測" before recognition starts (or after it stops without a final read).
 function resetWeightDisplay() {
-  const actWtEl = document.getElementById('stat-act-wt');
-  const wokEl   = document.getElementById('stat-wt-ok');
-  const wokBox  = document.getElementById('stat-wt-ok-box');
-  if (actWtEl) actWtEl.textContent = '未量測';
-  if (wokEl && wokBox) {
-    wokEl.textContent = WEIGHT_STATE_LABEL.waiting_weight;
-    wokBox.className  = weightStateClass('waiting_weight');
-  }
   _lastKnownWV = null;
+  renderWeightVerification({ state: 'waiting_weight', actual: null, expected: null });
+  _lastKnownWV = null;
+  renderOverallStatus();
 }
 
 async function weightPollingLoop(token, reason) {
@@ -1307,6 +1538,7 @@ async function startRecognize() {
       const res  = await fetch('/upload', { method: 'POST', body: form });
       const data = await res.json();
       if (data.ok) {
+        hasCurrentResult = true;
         rerenderTable(data.counts);
         setUpdateTime(data.timestamp);
         showAnnotatedImage(data.annotated_image);
