@@ -415,8 +415,20 @@ Switching is an all-or-nothing transaction:
 5. recognition resumes if it was running — on success *and* on failure
 
 `ok: true` therefore means the model is loaded and usable, not merely accepted.
-While a startup load is still in progress `/status` reports `model_ready: false`
-with `model_loading: true`.
+
+Startup applies the same bar: load → compatibility → warmup. Until all three
+pass, `/status` reports `model_ready: false` (with `model_loading: true` while
+it is still working), and `/upload`, `/recognize` and recognition start return
+**503** rather than lazily loading an unverified model.
+
+`model_error` and `last_switch_error` are separate: after a failed switch is
+rolled back, the restored model is healthy (`model_error: null`) even though the
+switch failed (`last_switch_error` set).
+
+Results carry the package and generation that produced them. Any reader that
+finds a result from a superseded activation reports `result_stale: true` and
+serves no counts, so no API can combine one package's detections with another's
+standards.
 
 Profile edits carry the package they were made against (`X-Model-Package`), so a
 debounced standards edit that arrives after a switch is refused with **409**

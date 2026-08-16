@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 from app.inference.package import ModelPackage
+from app.validation import clean_loaded_quantity, clean_loaded_weight
 
 logger = logging.getLogger(__name__)
 
@@ -64,22 +65,30 @@ def _read_json_dict(path: Path) -> Optional[Dict[str, Any]]:
 
 
 def _coerce_ints(data: Mapping[str, Any]) -> Dict[str, int]:
+    """Validate quantities read from disk.
+
+    Bad values are DROPPED with a warning, never repaired: turning a stored 1.7
+    into 1 would invent an expected quantity nobody configured, and clamping a
+    negative to 0 would silently disable an expected instrument.
+    """
     out: Dict[str, int] = {}
     for key, value in data.items():
-        try:
-            out[str(key)] = max(0, int(value))
-        except (TypeError, ValueError):
-            logger.warning("[profile] dropping non-integer standard %r=%r", key, value)
+        ok, quantity = clean_loaded_quantity(str(key), value)
+        if not ok:
+            logger.warning("[profile] dropping invalid standard %r=%r", key, value)
+            continue
+        out[str(key)] = quantity
     return out
 
 
 def _coerce_floats(data: Mapping[str, Any]) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for key, value in data.items():
-        try:
-            out[str(key)] = max(0.0, float(value))
-        except (TypeError, ValueError):
-            logger.warning("[profile] dropping non-numeric unit weight %r=%r", key, value)
+        ok, weight = clean_loaded_weight(str(key), value)
+        if not ok:
+            logger.warning("[profile] dropping invalid unit weight %r=%r", key, value)
+            continue
+        out[str(key)] = weight
     return out
 
 

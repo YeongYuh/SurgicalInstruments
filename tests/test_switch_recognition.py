@@ -210,3 +210,142 @@ def test_already_active_switch_reports_current_recognition(api, monkeypatch):
     assert payload["recognition_resumed"] is True
     assert cam.stop_calls == 0        # nothing was disturbed
     assert cam.start_calls == 0
+
+
+# ── SI-PLATFORM-003: 17 & 18. the response must carry the FINAL camera state ─
+
+def test_camera_stopped_during_the_switch_is_reported_as_off(api, monkeypatch):
+    """A switch can take 10+ seconds; the pre-switch snapshot is not evidence.
+
+    Reporting camera_running from before the operation would tell the UI the
+    camera is still on after the operator closed it, and the frontend trusts
+    that field.
+    """
+    client, manager = api
+    cam = FakeCamera(running=True, recognizing=True)
+    _set_camera(monkeypatch, cam)
+
+    original_activate = manager.activate
+
+    def activate_then_camera_stops(*args, **kwargs):
+        result = original_activate(*args, **kwargs)
+        cam.stop_camera()          # operator closes the camera mid-switch
+        return result
+
+    monkeypatch.setattr(manager, "activate", activate_then_camera_stops)
+
+    response, payload = _switch(client, "b")
+
+    assert payload["ok"] is True
+    assert payload["camera_running"] is False       # final state, not the snapshot
+    assert payload["recognition_running"] is False
+    assert payload["recognition_was_running"] is True   # the original intent
+    assert payload["recognition_resumed"] is False
+
+
+def test_failed_switch_also_reports_the_final_camera_state(api, monkeypatch):
+    client, manager = api
+    cam = FakeCamera(running=True, recognizing=True)
+    _set_camera(monkeypatch, cam)
+
+    original_activate = manager.activate
+
+    def activate_then_camera_stops(*args, **kwargs):
+        try:
+            return original_activate(*args, **kwargs)
+        finally:
+            cam.stop_camera()
+
+    monkeypatch.setattr(manager, "activate", activate_then_camera_stops)
+
+    response, payload = _switch(client, "bad")
+
+    assert response.status_code == 400
+    assert payload["camera_running"] is False
+    assert payload["recognition_running"] is False
+    assert payload["recognition_resumed"] is False
+    assert payload["active"] == "a"
+
+
+def test_successful_switch_reports_camera_still_running(api, monkeypatch):
+    client, _ = api
+    cam = FakeCamera(running=True, recognizing=True)
+    _set_camera(monkeypatch, cam)
+
+    _, payload = _switch(client, "b")
+
+    assert payload["camera_running"] is True
+    assert payload["recognition_running"] is True
+    assert payload["recognition_resumed"] is True
+
+
+# ── 30 & 31. model_error vs last_switch_error ───────────────────────────────
+
+def test_successful_rollback_reports_a_healthy_model(api, monkeypatch):
+    """After a rollback the ACTIVE model is fine; only the switch failed.
+
+    Reporting the failed target's error as the current model error would make a
+    perfectly working system look broken.
+    """
+    client, manager = api
+    _set_camera(monkeypatch, None)
+
+    _, payload = _switch(client, "bad")
+    assert payload["ok"] is False
+
+    assert manager.state().ready is True
+    assert manager.model_error is None
+    assert manager.last_switch_error
+    assert "bad" in manager.last_switch_error
+
+    status = json.loads(client.get("/status").data.decode("utf-8"))
+    assert status["model_ready"] is True
+    assert status["model_error"] is None
+    assert status["last_switch_error"]
+
+    info = json.loads(client.get("/api/model-package").data.decode("utf-8"))
+    assert info["ready"] is True
+    assert info["model_error"] is None
+    assert info["last_switch_error"]
+
+
+def test_failed_rollback_reports_an_unusable_model(api, monkeypatch):
+    """If the old model cannot come back, say so — do not fake operational."""
+    client, manager = api
+    _set_camera(monkeypatch, None)
+
+    old_adapter = manager.active_adapter
+    original_load = old_adapter.load
+
+    def refuse_reload():
+        raise RuntimeError("simulated: old model cannot be reloaded")
+
+    monkeypatch.setattr(old_adapter, "load", refuse_reload)
+
+    _, payload = _switch(client, "bad")
+
+    assert payload["ok"] is False
+    assert manager.state().ready is False
+    assert manager.model_error
+    assert "rollback failed" in manager.model_error
+    assert manager.last_switch_error
+
+    status = json.loads(client.get("/status").data.decode("utf-8"))
+    assert status["model_ready"] is False
+    assert status["model_error"]
+
+    monkeypatch.setattr(old_adapter, "load", original_load)
+
+
+def test_a_successful_switch_clears_the_previous_switch_error(api, monkeypatch):
+    client, manager = api
+    _set_camera(monkeypatch, None)
+
+    _switch(client, "bad")
+    assert manager.last_switch_error
+
+    _, payload = _switch(client, "b")
+
+    assert payload["ok"] is True
+    assert manager.last_switch_error is None
+    assert manager.model_error is None

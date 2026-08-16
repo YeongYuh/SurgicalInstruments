@@ -37,7 +37,7 @@ import math
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from app.inference.base import ModelAdapter
 from app.inference.package import (
@@ -77,6 +77,28 @@ class ModelBusyError(ModelManagerError):
     """The lifecycle gate could not be acquired in time."""
 
 
+class ModelNotReadyError(ModelManagerError):
+    """The active model is not loaded, warmed, and verified yet.
+
+    ``loading`` distinguishes "wait a moment" from "this is broken", which the
+    web layer turns into different messages for the operator.
+    """
+
+    def __init__(self, message: str, *, loading: bool = False,
+                 detail: Optional[str] = None) -> None:
+        self.loading = loading
+        self.detail = detail
+        super().__init__(message)
+
+
+class ProfileValidationError(ModelManagerError):
+    """A profile edit the active model could never satisfy."""
+
+    def __init__(self, message: str, *, invalid: Optional[List[str]] = None) -> None:
+        self.invalid = list(invalid or [])
+        super().__init__(message)
+
+
 def _usable_weight(value: Any) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
@@ -91,14 +113,16 @@ class ActiveState:
     pairing one package's counts with another package's standards.
     """
 
-    __slots__ = ("generation", "package", "profile", "adapter")
+    __slots__ = ("generation", "package", "profile", "adapter", "model_error")
 
     def __init__(self, generation: int, package: Optional[ModelPackage],
-                 profile: Optional[PackageProfile], adapter: Optional[ModelAdapter]) -> None:
+                 profile: Optional[PackageProfile], adapter: Optional[ModelAdapter],
+                 model_error: Optional[str] = None) -> None:
         self.generation = generation
         self.package = package
         self.profile = profile
         self.adapter = adapter
+        self.model_error = model_error
 
     @property
     def configured(self) -> bool:
@@ -112,9 +136,17 @@ class ActiveState:
 
     @property
     def ready(self) -> bool:
-        """The model is actually loaded and can run right now."""
-        return self.configured and bool(self.adapter and self.adapter.loaded
-                                        and not self.adapter.retired)
+        """The model is loaded, verified, and can run right now.
+
+        A loaded model is not automatically a usable one: startup also has to
+        clear the compatibility check and the warmup, and either failing leaves
+        ``model_error`` set.  Reporting ready on "the file loaded" alone is how
+        a kiosk ends up claiming it can count instruments it cannot see.
+        """
+        return (self.configured
+                and bool(self.adapter and self.adapter.loaded
+                         and not self.adapter.retired)
+                and not self.model_error)
 
     @property
     def package_id(self) -> str:
@@ -235,9 +267,18 @@ class ModelManager:
         self._adapter: Optional[ModelAdapter] = None
         self._packages: Dict[str, DiscoveredPackage] = {}
         self._last_error: Optional[str] = None
-        self._fatal_error: Optional[str] = None
+        # Is the ACTIVE model unusable right now?  Distinct from the reason the
+        # last switch attempt failed: after a successful rollback the previous
+        # model is perfectly healthy, and reporting the failed target's error as
+        # the current model's error would read as a broken system.
+        self._model_error: Optional[str] = None
+        self._last_switch_error: Optional[str] = None
         self._loading = False
         self._compatibility: Dict[str, Any] = {}
+        # Called inside the lifecycle gate right after a successful publish, so
+        # application state derived from the old package is cleared before any
+        # reader can observe "new package + old counts".
+        self._switch_listeners: List[Callable[["ActiveState"], None]] = []
 
     # ── discovery ─────────────────────────────────────────────────────────
 
@@ -271,7 +312,8 @@ class ModelManager:
 
     def state(self) -> ActiveState:
         with self._state_lock:
-            return ActiveState(self._generation, self._package, self._profile, self._adapter)
+            return ActiveState(self._generation, self._package, self._profile,
+                               self._adapter, self._model_error)
 
     @property
     def generation(self) -> int:
@@ -299,9 +341,35 @@ class ModelManager:
             return self._last_error
 
     @property
-    def fatal_error(self) -> Optional[str]:
+    def model_error(self) -> Optional[str]:
+        """Why the ACTIVE model cannot be used — None when it is healthy."""
         with self._state_lock:
-            return self._fatal_error
+            return self._model_error
+
+    #: kept for callers written against the previous name
+    @property
+    def fatal_error(self) -> Optional[str]:
+        return self.model_error
+
+    @property
+    def last_switch_error(self) -> Optional[str]:
+        """Why the most recent switch ATTEMPT failed — survives a rollback."""
+        with self._state_lock:
+            return self._last_switch_error
+
+    def add_switch_listener(self, listener: Callable[["ActiveState"], None]) -> None:
+        """Register a callback run inside the gate on every successful switch."""
+        with self._state_lock:
+            self._switch_listeners.append(listener)
+
+    def _notify_switch(self, state: "ActiveState") -> None:
+        with self._state_lock:
+            listeners = list(self._switch_listeners)
+        for listener in listeners:
+            try:
+                listener(state)
+            except Exception as exc:  # noqa: BLE001 - a listener must not undo a switch
+                logger.warning("[models] switch listener failed: %s", exc)
 
     @property
     def loading(self) -> bool:
@@ -344,16 +412,38 @@ class ModelManager:
         the ``with`` block.  A package switch cannot begin until it closes, so
         no result can ever be published against a package that replaced the one
         it came from.
+
+        Requires a READY model.  Accepting a merely-configured one would let an
+        upload arriving during startup grab the gate and lazily load the model
+        itself, skipping the compatibility and warmup checks that decide whether
+        this package may be used at all.
+
+        Readiness is checked BEFORE taking the gate as well as after: during a
+        startup load the gate is held for many seconds, and a request should be
+        told "still loading" straight away rather than queueing behind it and
+        then succeeding as if nothing had happened.
         """
+        self._require_ready()
         with self._gate(timeout, what="inference"):
-            state = self.state()
-            if not state.configured:
-                raise ModelManagerError(
-                    "no active model package (%s)" % (self.last_error or "not configured"))
-            fatal = self.fatal_error
-            if fatal:
-                raise ModelManagerError("model is not usable: %s" % fatal)
+            state = self._require_ready()
             yield InferenceSession(self, state)
+
+    def _require_ready(self) -> ActiveState:
+        """Raise unless the active model is loaded, verified, and usable."""
+        state = self.state()
+        if not state.configured:
+            raise ModelNotReadyError(
+                "no active model package (%s)" % (self.last_error or "not configured"),
+                loading=False, detail=self.last_error)
+        if state.model_error:
+            raise ModelNotReadyError("model is not usable: %s" % state.model_error,
+                                     loading=False, detail=state.model_error)
+        if not state.ready:
+            loading = self.loading
+            raise ModelNotReadyError(
+                "model is still loading" if loading else "model is not loaded",
+                loading=loading, detail=self.last_error)
+        return state
 
     # ── activation ────────────────────────────────────────────────────────
 
@@ -436,7 +526,7 @@ class ModelManager:
             self._compatibility = dict(compatibility)
             self._generation += 1
             self._last_error = None
-            self._fatal_error = None
+            self._model_error = None
             generation = self._generation
         if adapter.loaded:
             self._ready_event.set()
@@ -449,7 +539,7 @@ class ModelManager:
         """Bring the previous package back into service after a failed switch.
 
         Called with the lifecycle gate held.  If the old model refuses to load
-        again the manager goes into an explicit fatal state rather than
+        again the manager goes into an explicit unusable state rather than
         reporting an operational system that cannot actually run.
         """
         if adapter is None or package is None:
@@ -461,14 +551,16 @@ class ModelManager:
                 self._package = package
                 self._profile = profile
                 self._adapter = adapter
-                self._fatal_error = None
+                # The failed target's error belongs to the switch, not to this
+                # model — it is healthy again and must not look broken.
+                self._model_error = None
             self._ready_event.set()
             logger.info("[models] rolled back to package '%s'", package.id)
         except Exception as exc:  # noqa: BLE001
             message = ("rollback failed: package '%s' could not be reloaded: %s"
                        % (package.id, exc))
             with self._state_lock:
-                self._fatal_error = message
+                self._model_error = message
                 self._last_error = message
             self._ready_event.clear()
             logger.error("[models] %s", message)
@@ -507,10 +599,27 @@ class ModelManager:
                 with self._state_lock:
                     self._loading = True
                 self._ready_event.clear()
+                # 1. Free the old model FIRST — never two heavy models resident.
+                #    Strict: if teardown fails the weights may still be held, so
+                #    loading a replacement on top of them is not a risk worth
+                #    taking on a 4 GB board.  Abort without touching the target.
+                if old_adapter is not None:
+                    try:
+                        old_adapter.unload(strict=True)
+                    except Exception as exc:  # noqa: BLE001
+                        message = ("cannot switch to '%s': releasing the current model "
+                                   "failed (%s) — refusing to load a second model"
+                                   % (package.id, exc))
+                        with self._state_lock:
+                            self._last_error = message
+                            self._last_switch_error = message
+                            self._loading = False
+                        if old_adapter.loaded:
+                            self._ready_event.set()
+                        logger.error("[models] %s", message)
+                        raise ModelManagerError(message)
+
                 try:
-                    # 1. free the old model first — never two heavy models resident
-                    if old_adapter is not None:
-                        old_adapter.unload()
                     # 2. load the replacement
                     new_adapter.load()
                     # 3. warmup is the verification gate for a runtime switch:
@@ -531,6 +640,7 @@ class ModelManager:
                     self._restore(old_package, old_profile, old_adapter)
                     with self._state_lock:
                         self._last_error = message
+                        self._last_switch_error = message
                         self._loading = False
                     logger.error("[models] %s", message)
                     raise ModelManagerError(message)
@@ -538,6 +648,7 @@ class ModelManager:
                 generation = self._publish(package, profile, new_adapter, compatibility)
                 with self._state_lock:
                     self._loading = False
+                    self._last_switch_error = None
                 # The outgoing adapter is retired, not merely unloaded, so a
                 # stray reference can never resurrect a second resident model.
                 if old_adapter is not None and old_adapter is not new_adapter:
@@ -545,6 +656,9 @@ class ModelManager:
                         old_adapter.retire()
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("[models] error retiring previous adapter: %s", exc)
+                # Still inside the gate: application state derived from the old
+                # package is cleared before any reader can see the new package.
+                self._notify_switch(self.state())
 
             logger.info("[models] package '%s' active — generation=%d", package.id, generation)
             return self.state()
@@ -596,7 +710,22 @@ class ModelManager:
         return self.state()
 
     def _background_load(self, package_id: str, generation: int) -> None:
-        """Load the startup model under the same gate as everything else."""
+        """Load the startup model under the same gate as everything else.
+
+        Startup applies exactly the same correctness bar as a runtime switch:
+        load, then compatibility, then warmup.  Any of them failing leaves the
+        package *configured* (so the UI can show which one is broken) but not
+        *ready*, and nothing may infer against it.  Two different standards for
+        the same package would mean a unit that boots into a state a switch
+        would have refused.
+        """
+        def _fail(message: str, *, warmup: bool = False) -> None:
+            logger.error("[models] %s", message)
+            with self._state_lock:
+                self._last_error = message
+                self._model_error = message
+            self._ready_event.clear()
+
         try:
             with self._gate(what="startup load"):
                 # A runtime switch may have overtaken us while we waited for the
@@ -607,31 +736,86 @@ class ModelManager:
                                 package_id, self.generation)
                     return
                 adapter = self.active_adapter
-                if adapter is None:
+                package = self.active_package
+                profile = self.active_profile
+                if adapter is None or package is None or profile is None:
                     return
+
                 try:
                     adapter.load()
                 except Exception as exc:  # noqa: BLE001
-                    message = "startup load of '%s' failed: %s" % (package_id, exc)
-                    logger.error("[models] %s", message)
-                    with self._state_lock:
-                        self._last_error = message
-                        self._fatal_error = message
-                    self._ready_event.clear()
+                    _fail("startup load of '%s' failed: %s" % (package_id, exc))
                     return
-                profile = self.active_profile
-                if profile is not None:
-                    with self._state_lock:
-                        self._compatibility = self._build_compatibility(profile, adapter)
-                # Startup warmup stays lenient — the model already loaded, and a
-                # warmup hiccup must not stop the unit from booting.
-                adapter.warmup(strict=False)
+
+                compatibility = self._build_compatibility(profile, adapter)
+                with self._state_lock:
+                    self._compatibility = compatibility
+                try:
+                    self._assert_compatible(package, compatibility)
+                except ModelManagerError as exc:
+                    _fail("startup package '%s' is incompatible: %s" % (package_id, exc))
+                    return
+
+                # Warmup runs a real inference at the production image size.  If
+                # that fails the model demonstrably cannot run, so claiming
+                # model_ready would be a lie the operator finds out mid-inventory.
+                warmup_error = adapter.warmup(strict=False)
+                if warmup_error:
+                    _fail("startup warmup of '%s' failed: %s" % (package_id, warmup_error),
+                          warmup=True)
+                    return
+
                 self._ready_event.set()
+                logger.info("[models] startup package '%s' ready", package_id)
         finally:
             with self._state_lock:
                 self._loading = False
 
     # ── profile edits ─────────────────────────────────────────────────────
+
+    def _validate_standards_edit(self, values: Dict[str, Any],
+                                 profile: PackageProfile,
+                                 adapter: Optional[ModelAdapter]) -> None:
+        """Reject an expectation the active model could never satisfy.
+
+        Checked at edit time rather than at the next switch: an operator who
+        asks for an instrument this model cannot detect, or one with no unit
+        weight, has configured a tray that can never be reported complete, and
+        should find out while they are still looking at the screen.
+
+        A quantity of 0 is always allowed — that is how an unused class is
+        turned off.
+        """
+        class_weights = profile.class_weights
+        model_classes = None
+        if adapter is not None:
+            names = adapter.model_info.class_names
+            if names:
+                model_classes = set(str(n) for n in names)
+
+        unknown: List[str] = []
+        unpriced: List[str] = []
+        for cls, qty in values.items():
+            try:
+                quantity = int(qty or 0)
+            except (TypeError, ValueError):
+                continue
+            if quantity <= 0:
+                continue
+            if model_classes is not None and cls not in model_classes:
+                unknown.append(cls)
+            elif not _usable_weight(class_weights.get(cls)):
+                unpriced.append(cls)
+
+        problems = []
+        if unknown:
+            problems.append("目前模型無法辨識：%s" % "、".join(sorted(unknown)))
+        if unpriced:
+            problems.append("尚未設定單重：%s" % "、".join(sorted(unpriced)))
+        if problems:
+            raise ProfileValidationError(
+                "無法設定標準數量 — " + "；".join(problems),
+                invalid=sorted(set(unknown) | set(unpriced)))
 
     def update_active_profile(self, kind: str, values: Dict[str, Any], *,
                               package_id: Optional[str] = None) -> Dict[str, Any]:
@@ -650,6 +834,7 @@ class ModelManager:
             if profile is None:
                 raise ModelManagerError("no active model package — cannot edit %s" % kind)
             if kind == "standards":
+                self._validate_standards_edit(values, profile, self._adapter)
                 return profile.update_standards(values)
             if kind == "unit_weights":
                 return profile.update_unit_weights(values)
@@ -680,7 +865,9 @@ class ModelManager:
                 "generation": state.generation,
                 "package_id": None,
                 "error": self.last_error,
-                "fatal_error": self.fatal_error,
+                "model_error": self.model_error,
+                "last_switch_error": self.last_switch_error,
+                "fatal_error": self.model_error,   # legacy alias
                 "packages_dir": str(self.packages_dir),
             }
         adapter = state.adapter
@@ -697,7 +884,10 @@ class ModelManager:
             "class_weights_count": len(state.class_weights),
             "compatibility": self.compatibility,
             "error": self.last_error,
-            "fatal_error": self.fatal_error,
+            # Whether THIS model is unusable, versus why the last switch failed.
+            "model_error": self.model_error,
+            "last_switch_error": self.last_switch_error,
+            "fatal_error": self.model_error,   # legacy alias
         })
         return payload
 

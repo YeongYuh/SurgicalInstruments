@@ -78,14 +78,41 @@ from app.inference import (
     AdapterError,
     ModelBusyError,
     ModelManagerError,
+    ModelNotReadyError,
     PackageMismatchError,
+    ProfileValidationError,
     available_adapters,
+)
+from app.runtime_result import sanitize_runtime_result
+from app.validation import (
+    ValueValidationError,
+    parse_standards_map,
+    parse_unit_weights_map,
 )
 from app.visualizer import draw_detections
 from app.web import history as hist
 from app.web import report as rpt
 from app.web.camera import CameraThread
 from app.weight_verification import compute_weight_verification
+
+
+def _not_ready_response(exc: ModelNotReadyError):
+    """503 while the model is loading or unusable.
+
+    Deliberately not a generic failure: the operator needs to know whether to
+    wait a moment or to fix a broken package.
+    """
+    manager = web_pkg.model_manager
+    message = ("器械模型載入中，請稍候" if exc.loading
+               else "器械模型無法使用：%s" % (exc.detail or exc))
+    return jsonify(
+        ok=False,
+        error=message,
+        detail=str(exc),
+        model_loading=exc.loading,
+        model_error=manager.model_error,
+        last_switch_error=manager.last_switch_error,
+    ), 503
 
 
 # ── Scale helpers ────────────────────────────────────────────────────────────
@@ -181,6 +208,10 @@ def _run_image_inference(image_bgr: np.ndarray, source_label: str) -> dict:
                 "model_generation": session.generation,
                 "inference_ms": round(result.inference_ms, 1),
             }
+    except ModelNotReadyError:
+        # Handled by the caller as a 503 — the platform must not lazily load an
+        # unverified model just because a request arrived early.
+        raise
     except ModelManagerError as exc:
         return {"ok": False, "error": str(exc)}
     except AdapterError as exc:
@@ -206,7 +237,10 @@ def upload():
     image = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if image is None:
         return jsonify(ok=False, error="Cannot decode image"), 400
-    return jsonify(_run_image_inference(image, "upload"))
+    try:
+        return jsonify(_run_image_inference(image, "upload"))
+    except ModelNotReadyError as exc:
+        return _not_ready_response(exc)
 
 
 @app.route("/recognize", methods=["POST"])
@@ -222,7 +256,10 @@ def recognize():
     image = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if image is None:
         return jsonify(ok=False, error="Cannot decode camera frame"), 400
-    return jsonify(_run_image_inference(image, "webcam_snapshot"))
+    try:
+        return jsonify(_run_image_inference(image, "webcam_snapshot"))
+    except ModelNotReadyError as exc:
+        return _not_ready_response(exc)
 
 
 @app.route("/video_feed")
@@ -353,14 +390,22 @@ def camera_result():
         cam = web_pkg.camera_thread
     if cam is None:
         return jsonify(ok=False, error="Camera not started")
-    result = cam.get_result()
-    result["ok"] = True
     model_state = web_pkg.model_manager.state()
+    # Drop the counts first if they came from a package that is no longer
+    # active.  Re-reading them against the current package's standards would
+    # judge one instrument family by another's expectations.
+    result = sanitize_runtime_result(cam.get_result(), model_state)
+    result["ok"] = True
     sample = _current_sample()
     result["weight_sample"] = sample.to_dict()
-    result["weight_verification"] = compute_weight_verification(
-        model_state.standards, model_state.class_weights, sample, config.WEIGHT_TOLERANCE
-    )
+    if result.get("result_stale"):
+        result["weight_verification"] = None
+    else:
+        result["weight_verification"] = compute_weight_verification(
+            model_state.standards, model_state.class_weights,
+            sample, config.WEIGHT_TOLERANCE)
+    result["active_package"] = model_state.package_id or None
+    result["model_generation"] = model_state.generation
     return jsonify(result)
 
 
@@ -503,13 +548,14 @@ def camera_recognition_start():
     # first inference, long after the UI said recognition had started.
     manager = web_pkg.model_manager
     if not manager.wait_until_ready(timeout=30.0):
-        detail = manager.fatal_error or manager.last_error
+        detail = manager.model_error or manager.last_error
         if manager.loading:
             return jsonify(ok=False, error="器械模型載入中，請稍候再試",
                            model_loading=True), 503
         return jsonify(ok=False,
                        error="器械模型無法使用：%s" % (detail or "尚未載入"),
-                       model_loading=False), 503
+                       model_loading=False,
+                       model_error=manager.model_error), 503
     cam.start_recognition()
     _start_scale_bg_poll()   # idempotent — the thread normally runs already
     st = cam.get_status()
@@ -621,7 +667,11 @@ def status():
     # Built explicitly rather than splatted: latest_state carries its own
     # model_generation (the one that produced the counts on screen), which is a
     # different thing from the currently active generation.
-    payload = dict(state)
+    #
+    # sanitize_runtime_result clears the counts entirely when they belong to a
+    # superseded package, so the frontend can never render package B's标准
+    # against package A's detections during the switch window.
+    payload = sanitize_runtime_result(state, model_state)
     payload.update({
         "camera_active": cam_running,
         "camera_stopping": cam_stopping,
@@ -641,7 +691,10 @@ def status():
         "model_loading": manager.loading,
         "model_warmup_error": (model_state.adapter.warmup_error
                                if model_state.adapter is not None else None),
-        "model_error": manager.fatal_error or manager.last_error,
+        # Whether the ACTIVE model is unusable — None once a rollback has put a
+        # healthy model back in service, even though the switch itself failed.
+        "model_error": manager.model_error,
+        "last_switch_error": manager.last_switch_error,
     })
     return jsonify(payload)
 
@@ -721,6 +774,7 @@ def api_model_package_post():
     if current.ready and current.package_id == package_id:
         return jsonify(ok=True, status="already_active",
                        camera_running=camera_running,
+                       recognition_running=was_recognizing,
                        recognition_was_running=was_recognizing,
                        recognition_resumed=was_recognizing,
                        **manager.model_info())
@@ -736,29 +790,40 @@ def api_model_package_post():
         # activate() has already rolled the previous model back into service.
         resumed = _resume_recognition(cam, was_recognizing)
         state = manager.state()
+        # Re-read the camera: a switch can take 10+ seconds, and the operator
+        # may have closed the camera during it.  Reporting the snapshot taken
+        # before the switch would tell the UI the camera is still on.
+        _, final_camera_running, final_recognizing = _camera_snapshot()
         return jsonify(
             ok=False,
             error=str(exc),
             active=state.package_id or None,
             model_ready=state.ready,
-            fatal_error=manager.fatal_error,
-            camera_running=camera_running,
+            model_error=manager.model_error,
+            last_switch_error=manager.last_switch_error,
+            fatal_error=manager.model_error,
+            camera_running=final_camera_running,
+            recognition_running=final_recognizing,
             recognition_was_running=was_recognizing,
             recognition_resumed=resumed,
         ), 400
 
-    # Invalidate everything produced by the previous package.
+    # Application state derived from the old package was already cleared inside
+    # the switch transaction (ModelManager switch listener); this is belt and
+    # braces for a manager configured without the listener.
     web_pkg.reset_latest_state()
     if cam is not None:
         cam.invalidate_results()
 
     resumed = _resume_recognition(cam, was_recognizing)
+    _, final_camera_running, final_recognizing = _camera_snapshot()
     logger.info("[model-switch] now active: '%s' (generation=%d)",
                 package_id, manager.generation)
     return jsonify(
         ok=True,
         status="switched",
-        camera_running=camera_running,
+        camera_running=final_camera_running,
+        recognition_running=final_recognizing,
         recognition_was_running=was_recognizing,
         recognition_stopped=was_recognizing,
         recognition_resumed=resumed,
@@ -789,7 +854,11 @@ def get_report():
 def bom_report():
     model_state = web_pkg.model_manager.state()
     with web_pkg.state_lock:
-        state = copy.deepcopy(web_pkg.latest_state)
+        raw_state = copy.deepcopy(web_pkg.latest_state)
+    # A BOM built from the previous package's counts against the current
+    # package's standards would be a fabricated discrepancy report, so stale
+    # counts are dropped rather than reinterpreted.
+    state = sanitize_runtime_result(raw_state, model_state)
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     csv_str = rpt.generate_bom_csv(
@@ -851,19 +920,22 @@ def post_standards():
     package_id, values = _parse_profile_payload(request.get_json(silent=True))
     if not isinstance(values, dict):
         return jsonify(ok=False, error="Expected JSON object"), 400
-    parsed = {}
-    for k, v in values.items():
-        try:
-            parsed[str(k)] = max(0, int(v))
-        except (ValueError, TypeError):
-            return jsonify(ok=False, error=f"Invalid value for '{k}': {v}"), 400
+    # Same rules as the manifest validator: 1.7 instruments is a mistake, not a
+    # 1, and silently rounding it would change what the tray is expected to hold.
+    try:
+        parsed = parse_standards_map(values)
+    except ValueValidationError as exc:
+        return jsonify(ok=False, error=str(exc), field=exc.field, reason=exc.reason), 400
     try:
         web_pkg.update_standards(parsed, package_id=package_id)
     except PackageMismatchError as exc:
         return _mismatch_response(exc)
+    except ProfileValidationError as exc:
+        return jsonify(ok=False, error=str(exc), invalid=exc.invalid), 400
     except ModelManagerError as exc:
         return jsonify(ok=False, error=str(exc)), 409
-    return jsonify(ok=True, package_id=web_pkg.model_manager.state().package_id or None)
+    return jsonify(ok=True, package_id=web_pkg.model_manager.state().package_id or None,
+                   standards=web_pkg.get_standards())
 
 
 @app.route("/class_weights")
@@ -882,19 +954,20 @@ def post_unit_weights():
     package_id, values = _parse_profile_payload(request.get_json(silent=True))
     if not isinstance(values, dict):
         return jsonify(ok=False, error="Expected JSON object"), 400
-    parsed = {}
-    for k, v in values.items():
-        try:
-            parsed[str(k)] = max(0.0, float(v))
-        except (ValueError, TypeError):
-            return jsonify(ok=False, error=f"Invalid value for '{k}': {v}"), 400
+    try:
+        parsed = parse_unit_weights_map(values)
+    except ValueValidationError as exc:
+        return jsonify(ok=False, error=str(exc), field=exc.field, reason=exc.reason), 400
     try:
         web_pkg.update_unit_weights(parsed, package_id=package_id)
     except PackageMismatchError as exc:
         return _mismatch_response(exc)
+    except ProfileValidationError as exc:
+        return jsonify(ok=False, error=str(exc), invalid=exc.invalid), 400
     except ModelManagerError as exc:
         return jsonify(ok=False, error=str(exc)), 409
-    return jsonify(ok=True, package_id=web_pkg.model_manager.state().package_id or None)
+    return jsonify(ok=True, package_id=web_pkg.model_manager.state().package_id or None,
+                   unit_weights=web_pkg.get_unit_weights())
 
 
 @app.route("/system/shutdown", methods=["POST"])

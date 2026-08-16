@@ -90,18 +90,12 @@ class CameraThread(threading.Thread):
         with self._lock:
             return self._mjpeg_buffer, self._frame_seq
 
-    def get_latest_state(self) -> dict:
-        with self._lock:
-            return {
-                "timestamp": self._timestamp,
-                "counts": copy.deepcopy(self._counts),
-                "weight": self._weight,
-                "annotated_b64": (
-                    base64.b64encode(self._latest_annotated).decode()
-                    if self._latest_annotated
-                    else None
-                ),
-            }
+    # NOTE: there is deliberately no get_latest_state() variant that omits the
+    # package identity.  Every accessor that returns counts must carry
+    # package_id and model_generation, or a caller can reach a result without
+    # the means to tell whether it still belongs to the active package.
+    # get_result() is the one accessor; run it through
+    # app.runtime_result.sanitize_runtime_result before serving it.
 
     def get_status(self) -> dict:
         with self._lock:
@@ -131,12 +125,63 @@ class CameraThread(threading.Thread):
                 "weight": self._weight,
                 "package_id": self._package_id,
                 "package_display_name": self._package_display_name,
+                # Carried so readers can tell whether this result still belongs
+                # to the active package: the id alone is not enough, because a
+                # reload of the same package produces a new generation.
+                "model_generation": self._model_generation,
                 "annotated_b64": (
                     base64.b64encode(self._latest_annotated).decode()
                     if self._latest_annotated
                     else None
                 ),
             }
+
+    def commit_inference_result(self, generation: int, payload: dict) -> bool:
+        """Publish an inference result, or refuse it — one linearization point.
+
+        The staleness check and BOTH writes (camera-local result and the shared
+        application state) happen in a single critical section, ordered against
+        ``stop_recognition()`` which bumps the generation under the same lock.
+
+        Whichever gets the lock first wins: a result that commits before the
+        stop is a valid inventory taken while recognition was running, and one
+        that arrives after it is discarded entirely.  Checking staleness and
+        then publishing in two separate steps let a late worker write the UI
+        and the history *after* the operator had already been told recognition
+        had stopped.
+
+        Returns True when the result was published (and may be recorded in
+        history), False when it was refused.
+        """
+        import app.web as web_pkg
+
+        with self._lock:
+            if (self._stopping
+                    or not self._recognition_running
+                    or self._recognition_generation != generation):
+                return False
+
+            self._counts = payload["counts"]
+            self._weight = payload["weight"]
+            self._timestamp = payload["timestamp"]
+            self._last_detection_ts = payload["timestamp"]
+            self._package_id = payload["package_id"]
+            self._package_display_name = payload["package_display_name"]
+            self._model_generation = payload["model_generation"]
+            # _latest_annotated intentionally not set in camera mode
+
+            with web_pkg.state_lock:
+                web_pkg.latest_state.update({
+                    "timestamp": payload["timestamp"],
+                    "counts": copy.deepcopy(payload["counts"]),
+                    "weight": payload["weight"],
+                    "annotated_b64": None,  # live preview is the raw stream
+                    "weight_verification": payload["weight_verification"],
+                    "package_id": payload["package_id"],
+                    "package_display_name": payload["package_display_name"],
+                    "model_generation": payload["model_generation"],
+                })
+        return True
 
     def get_error(self) -> Optional[str]:
         with self._lock:
@@ -504,22 +549,20 @@ class CameraThread(threading.Thread):
 
                 # The model package cannot have changed — the session pins it —
                 # so the only staleness left is the operator stopping camera or
-                # recognition while we ran.
-                with self._lock:
-                    stale = (self._stopping
-                             or not self._recognition_running
-                             or self._recognition_generation != generation)
-                    if not stale:
-                        self._counts = counts
-                        self._weight = weight
-                        self._timestamp = ts
-                        self._last_detection_ts = ts
-                        self._package_id = session.package_id
-                        self._package_display_name = session.display_name
-                        self._model_generation = session.generation
-                        # _latest_annotated intentionally not set in camera mode
+                # recognition while we ran.  Commit is a single linearization
+                # point against stop_recognition(): either this result lands
+                # while recognition was still running, or it is dropped whole.
+                committed = self.commit_inference_result(generation, {
+                    "counts": counts,
+                    "weight": weight,
+                    "timestamp": ts,
+                    "package_id": session.package_id,
+                    "package_display_name": session.display_name,
+                    "model_generation": session.generation,
+                    "weight_verification": wv,
+                })
 
-                if stale:
+                if not committed:
                     print(f"[CameraThread] session={self.session_id} "
                           f"inference DISCARDED (stale) gen={generation} "
                           f"model_gen={session.generation}")
@@ -527,18 +570,6 @@ class CameraThread(threading.Thread):
                 if _debug:
                     print(f"[CameraThread] session={self.session_id} "
                           f"inference PUBLISHED gen={generation}")
-
-                with web_pkg.state_lock:
-                    web_pkg.latest_state.update({
-                        "timestamp": ts,
-                        "counts": copy.deepcopy(counts),
-                        "weight": weight,
-                        "annotated_b64": None,  # live preview is the raw stream
-                        "weight_verification": wv,
-                        "package_id": session.package_id,
-                        "package_display_name": session.display_name,
-                        "model_generation": session.generation,
-                    })
 
                 # Registers on the profile this inference actually ran against.
                 session.register_classes(counts.keys())

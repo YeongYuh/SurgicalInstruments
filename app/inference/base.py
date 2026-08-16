@@ -202,11 +202,18 @@ class ModelAdapter(ABC):
             result.model_info = self.model_info
         return result
 
-    def unload(self) -> None:
+    def unload(self, strict: bool = False) -> None:
         """Release the model.  Reversible — ``load()`` can bring it back.
 
         Setting ``_closing`` before taking the lock turns away new inference
         immediately, then the lock acquisition waits for any in-flight one.
+
+        ``strict=True`` is mandatory for a runtime package switch.  If teardown
+        raises, the runtime may well still be holding the weights; marking the
+        adapter unloaded anyway would let the manager load a replacement on top
+        of it and break the one-resident-model invariant that keeps a 4 GB
+        Jetson alive.  Strict mode therefore leaves ``loaded`` True and
+        re-raises, so the caller aborts instead of guessing.
         """
         self._closing = True
         try:
@@ -215,23 +222,44 @@ class ModelAdapter(ABC):
                     return
                 try:
                     self._do_unload()
-                except Exception as exc:  # noqa: BLE001 - teardown must never raise
-                    logger.warning("[adapter:%s] unload error: %s", self.name, exc)
-                finally:
-                    self._loaded = False
-                    logger.info("[adapter:%s] unloaded package=%s",
-                                self.name, self.package.id)
+                except Exception as exc:  # noqa: BLE001
+                    if strict:
+                        logger.error(
+                            "[adapter:%s] unload FAILED for package=%s: %s — the model "
+                            "may still be resident; refusing to report it unloaded",
+                            self.name, self.package.id, exc)
+                        raise AdapterError(
+                            "unload failed for package '%s': %s" % (self.package.id, exc))
+                    logger.warning("[adapter:%s] unload error (ignored): %s", self.name, exc)
+                self._loaded = False
+                logger.info("[adapter:%s] unloaded package=%s", self.name, self.package.id)
         finally:
             self._closing = False
 
-    def retire(self) -> None:
-        """Unload permanently.  A retired adapter can never run again.
+    def retire(self, strict: bool = False) -> None:
+        """Retire permanently.  A retired adapter can never run again.
 
-        Used for the outgoing adapter of a completed switch, so a stray
-        reference can never resurrect a second resident model.
+        ``_retired`` is set BEFORE teardown begins, so it is the linearization
+        point: from that instant every ``load()`` and ``infer()`` is refused,
+        including one already waiting on the execution lock.  Setting it after
+        the unload would leave a window in which a stray reference could lazily
+        reload the model and put two of them in memory.
         """
-        self.unload()
         self._retired = True
+        try:
+            self.unload(strict=strict)
+        except Exception:
+            if strict:
+                raise
+            # lenient teardown never propagates
+
+    @property
+    def state(self) -> str:
+        if self._retired:
+            return "retired"
+        if self._closing:
+            return "unloading"
+        return "loaded" if self._loaded else "idle"
 
     # alias — some callers think in terms of file handles
     close = unload

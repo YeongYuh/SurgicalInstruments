@@ -194,3 +194,127 @@ def test_no_temp_files_are_left_behind(api):
 
     leftovers = list(profile.standards_path.parent.glob("*.tmp"))
     assert leftovers == []
+
+
+# ── SI-PLATFORM-003: 19-24. runtime input is as strict as the manifest ──────
+
+@pytest.mark.parametrize("body,fragment", [
+    ('{"widget": 1.7}', "whole number"),
+    ('{"widget": true}', "boolean"),
+    ('{"widget": -1}', "negative"),
+    ('{"widget": NaN}', "finite"),
+    ('{"widget": Infinity}', "finite"),
+    ('{"widget": "two"}', "number"),
+    ('{"widget": null}', "number"),
+    ('{"widget": [1]}', "number"),
+])
+def test_standards_rejects_values_the_manifest_would_reject(api, body, fragment):
+    """1.7 instruments is a mistake, not a 1.
+
+    Silently rounding it would change what the tray is expected to hold, and the
+    operator would never see the correction.
+    """
+    client, manager = api
+    before = _json(client.get("/standards"))
+
+    response = client.post("/standards", data=body,
+                           content_type="application/json")
+
+    assert response.status_code == 400
+    assert fragment in _json(response)["error"]
+    assert _json(client.get("/standards")) == before      # nothing was written
+
+
+def test_standards_accepts_a_whole_float(api):
+    client, _ = api
+    response = client.post("/standards", data='{"widget": 3.0}',
+                           content_type="application/json")
+    assert response.status_code == 200
+    assert _json(client.get("/standards")) == {"widget": 3}
+
+
+@pytest.mark.parametrize("body,fragment", [
+    ('{"widget": -0.5}', "negative"),
+    ('{"widget": NaN}', "finite"),
+    ('{"widget": Infinity}', "finite"),
+    ('{"widget": -Infinity}', "finite"),
+    ('{"widget": true}', "boolean"),
+    ('{"widget": "heavy"}', "number"),
+])
+def test_unit_weights_reject_invalid_numbers(api, body, fragment):
+    client, _ = api
+    before = _json(client.get("/unit_weights"))
+
+    response = client.post("/unit_weights", data=body,
+                           content_type="application/json")
+
+    assert response.status_code == 400
+    assert fragment in _json(response)["error"]
+    assert _json(client.get("/unit_weights")) == before
+
+
+def test_unit_weights_accept_zero_and_fractions(api):
+    client, _ = api
+    assert client.post("/unit_weights", json={"widget": 0}).status_code == 200
+    assert client.post("/unit_weights", json={"widget": 12.75}).status_code == 200
+    assert _json(client.get("/unit_weights"))["widget"] == 12.75
+
+
+def test_profile_loading_drops_a_corrupt_value_rather_than_rounding_it(tmp_path):
+    """A stored 1.7 is corrupt data; turning it into 1 would invent a standard."""
+    from app.inference.profile import _coerce_ints
+
+    cleaned = _coerce_ints({"good": 2, "fractional": 1.7, "negative": -3,
+                            "text": "x", "nan": float("nan")})
+
+    assert cleaned == {"good": 2}
+
+
+# ── 25 & 26. an expectation the model could never satisfy ───────────────────
+
+def test_standard_for_an_unpriced_class_is_rejected(api):
+    """Without a unit weight the expected total would silently be too low."""
+    client, _ = api
+
+    response = client.post("/standards", json={"widget": 1, "mystery": 2})
+
+    assert response.status_code == 400
+    payload = _json(response)
+    assert "mystery" in payload["error"]
+    assert "mystery" in payload["invalid"]
+    assert _json(client.get("/standards")) == {"widget": 2}   # untouched
+
+
+def test_zero_standard_for_an_unpriced_class_is_allowed(api):
+    """Turning an unused class off must always be possible."""
+    client, _ = api
+    response = client.post("/standards", json={"widget": 2, "mystery": 0})
+    assert response.status_code == 200
+    assert _json(client.get("/standards"))["mystery"] == 0
+
+
+def test_standard_for_a_class_the_model_cannot_detect_is_rejected(tmp_path, monkeypatch):
+    """Configured now rather than discovered at the next restart."""
+    manager = make_manager(tmp_path / "cls")
+    write_package(manager.packages_dir, "listed",
+                  adapter="class_listing",
+                  class_weights={"scissors": 5.0, "ghost": 1.0},
+                  standards={"scissors": 1},
+                  adapter_options={"model_classes": ["scissors"]})
+    manager.activate("listed")
+
+    monkeypatch.setattr(web_pkg, "model_manager", manager)
+    monkeypatch.setattr(web_pkg, "camera_thread", None, raising=False)
+    web_pkg.app.config["TESTING"] = True
+
+    with web_pkg.app.test_client() as client:
+        response = client.post("/standards", json={"scissors": 1, "ghost": 2})
+        payload = _json(response)
+
+        assert response.status_code == 400
+        assert "ghost" in payload["error"]
+        assert "無法辨識" in payload["error"]
+        assert _json(client.get("/standards")) == {"scissors": 1}
+
+        # The same class at zero is fine.
+        assert client.post("/standards", json={"ghost": 0}).status_code == 200

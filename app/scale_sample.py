@@ -70,7 +70,7 @@ class StabilityTracker:
 
     def __init__(
         self,
-        window_sec: float = 1.5,
+        window_sec: float = 2.5,
         range_grams: float = 1.0,
         min_samples: int = 3,
         max_age_sec: float = 2.0,

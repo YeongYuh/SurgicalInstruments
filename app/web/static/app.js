@@ -18,6 +18,8 @@ let stdDebounce  = null;
 let uwDebounce   = null;
 let stdPendingPackage = null;   // package a pending standards edit belongs to
 let uwPendingPackage  = null;   // package a pending unit-weight edit belongs to
+let stdInFlight       = null;   // promise for a standards POST already on the wire
+let uwInFlight        = null;   // promise for a unit-weight POST already on the wire
 let donutChart   = null;
 let statusPollTimer          = null;   // the single /status setInterval handle
 let weightPollingActive      = false;
@@ -140,52 +142,95 @@ function collectStandardsInputs() {
   return payload;
 }
 
+// Read the backend's error message, falling back to the status code.
+async function readError(res) {
+  try {
+    const data = await res.json();
+    if (data && data.error) return data.error;
+  } catch (e) { /* not JSON */ }
+  return 'HTTP ' + res.status;
+}
+
 async function pushStandards(packageId) {
   const payload = collectStandardsInputs();
   const target = packageId || activePackageId;
-  try {
-    const res = await fetch('/standards', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Model-Package': target || '',
-      },
-      body: JSON.stringify({ package_id: target, values: payload }),
-    });
-    if (res.status === 409) {
-      // The package changed under this edit; the write was refused on purpose.
-      console.warn('[standards] rejected — package changed since the edit');
-      await fetchStandards();
+  const request = (async () => {
+    try {
+      const res = await fetch('/standards', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Model-Package': target || '',
+        },
+        body: JSON.stringify({ package_id: target, values: payload }),
+      });
+      if (res.status === 409) {
+        // The package changed under this edit; the write was refused on purpose.
+        console.warn('[standards] rejected — package changed since the edit');
+        await fetchStandards();
+        rerenderTable(lastCounts);
+        refreshWeightVerification();
+        return { ok: false, conflict: true, error: await readError(res) };
+      }
+      if (!res.ok) {
+        // Rejected (bad value, incompatible class, ...).  Do NOT pretend the
+        // local payload was stored — resync from the server instead, or the UI
+        // would show numbers that exist only in the browser.
+        const error = await readError(res);
+        console.error('[standards] rejected: ' + error);
+        await fetchStandards();
+        rerenderTable(lastCounts);
+        refreshWeightVerification();
+        return { ok: false, error };
+      }
+      let data = {};
+      try { data = await res.json(); } catch (e) { /* empty body */ }
+      standards = (data && data.standards) ? data.standards : payload;
       rerenderTable(lastCounts);
       refreshWeightVerification();
-      return false;
+      return { ok: true };
+    } catch (e) {
+      console.error('pushStandards:', e);
+      return { ok: false, error: e.message };
     }
-    standards = payload;
-    rerenderTable(lastCounts);
-    refreshWeightVerification();
-    return true;
-  } catch (e) { console.error('pushStandards:', e); return false; }
+  })();
+
+  stdInFlight = request;
+  try {
+    return await request;
+  } finally {
+    if (stdInFlight === request) stdInFlight = null;
+  }
 }
 
-// Send anything still sitting in a debounce timer, so switching packages never
-// silently discards the operator's last keystroke — nor lets it land on the
-// wrong package.
+// Send anything still pending before switching packages: both edits sitting in
+// a debounce timer AND requests already on the wire.  Waiting only on the timer
+// would let a request that fired 50 ms ago be forgotten, so the operator's last
+// keystroke could be lost (or rejected) without anyone noticing.
 async function flushPendingEdits() {
   const jobs = [];
   if (stdDebounce !== null) {
     clearTimeout(stdDebounce);
     stdDebounce = null;
     jobs.push(pushStandards(stdPendingPackage));
+  } else if (stdInFlight) {
+    jobs.push(stdInFlight);
   }
   if (uwDebounce !== null) {
     clearTimeout(uwDebounce);
     uwDebounce = null;
     jobs.push(pushUnitWeights(uwPendingPackage));
+  } else if (uwInFlight) {
+    jobs.push(uwInFlight);
   }
-  if (jobs.length) {
-    console.debug('[edits] flushing ' + jobs.length + ' pending edit(s) before switch');
-    await Promise.all(jobs);
-  }
+  if (!jobs.length) return { ok: true };
+
+  console.debug('[edits] flushing ' + jobs.length + ' pending edit(s) before switch');
+  const settled = await Promise.all(
+    jobs.map(p => Promise.resolve(p).catch(e => ({ ok: false, error: e && e.message })))
+  );
+  const failure = settled.find(r => r && r.ok === false);
+  return failure ? { ok: false, error: failure.error || '設定儲存失敗' } : { ok: true };
 }
 
 // ── Unit weights ──────────────────────────────────────────────────────────
@@ -254,9 +299,16 @@ async function onPackageChange(evt) {
   sel.disabled = true;
   setPackageStatus('切換中…', 'busy');
   try {
-    // Send any debounced edit first, tagged with the package it was typed
-    // against, so the operator's last keystroke is neither lost nor misapplied.
-    await flushPendingEdits();
+    // Send any pending edit first, tagged with the package it was typed
+    // against.  If it cannot be saved, abort the switch rather than silently
+    // discarding the operator's last change.
+    const flushed = await flushPendingEdits();
+    if (!flushed.ok) {
+      alert('設定尚未儲存，未切換器械套件：\n' + (flushed.error || '未知錯誤'));
+      sel.value = previous || '';
+      setPackageStatus('設定未儲存', 'error');
+      return;
+    }
 
     const res  = await fetch('/api/model-package', {
       method: 'POST',
@@ -311,16 +363,19 @@ async function syncRuntimeState(response) {
   let camRunning = null;
   let recRunning = null;
 
-  if (response && typeof response.camera_running === 'boolean') {
-    camRunning = response.camera_running;
-    recRunning = response.recognition_resumed === true;
-  } else {
-    try {
-      const d = await (await fetch('/camera/status')).json();
-      camRunning = d.running === true && d.stopping !== true;
-      recRunning = d.recognition_running === true && d.stopping !== true;
-    } catch (e) {
-      console.warn('[sync] /camera/status failed:', e.message);
+  // Always re-read the hardware.  A package switch can take ten seconds or
+  // more, and the operator may have closed the camera during it — a snapshot
+  // taken before the switch started is not evidence of anything now.
+  try {
+    const d = await (await fetch('/camera/status')).json();
+    camRunning = d.running === true && d.stopping !== true;
+    recRunning = d.recognition_running === true && d.stopping !== true;
+  } catch (e) {
+    console.warn('[sync] /camera/status failed:', e.message);
+    if (response && typeof response.camera_running === 'boolean') {
+      camRunning = response.camera_running;
+      recRunning = response.recognition_resumed === true;
+    } else {
       return;
     }
   }
@@ -348,25 +403,46 @@ async function pushUnitWeights(packageId) {
     payload[inp.dataset.cls] = parseFloat(inp.value) || 0;
   });
   const target = packageId || activePackageId;
-  try {
-    const res = await fetch('/unit_weights', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Model-Package': target || '',
-      },
-      body: JSON.stringify({ package_id: target, values: payload }),
-    });
-    if (res.status === 409) {
-      console.warn('[unit_weights] rejected — package changed since the edit');
-      await fetchUnitWeights();
+  const request = (async () => {
+    try {
+      const res = await fetch('/unit_weights', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Model-Package': target || '',
+        },
+        body: JSON.stringify({ package_id: target, values: payload }),
+      });
+      if (res.status === 409) {
+        console.warn('[unit_weights] rejected — package changed since the edit');
+        await fetchUnitWeights();
+        refreshWeightVerification();
+        return { ok: false, conflict: true, error: await readError(res) };
+      }
+      if (!res.ok) {
+        const error = await readError(res);
+        console.error('[unit_weights] rejected: ' + error);
+        await fetchUnitWeights();
+        refreshWeightVerification();
+        return { ok: false, error };
+      }
+      let data = {};
+      try { data = await res.json(); } catch (e) { /* empty body */ }
+      unitWeights = (data && data.unit_weights) ? data.unit_weights : payload;
       refreshWeightVerification();
-      return false;
+      return { ok: true };
+    } catch (e) {
+      console.error('pushUnitWeights:', e);
+      return { ok: false, error: e.message };
     }
-    unitWeights = payload;
-    refreshWeightVerification();
-    return true;
-  } catch (e) { console.error('pushUnitWeights:', e); return false; }
+  })();
+
+  uwInFlight = request;
+  try {
+    return await request;
+  } finally {
+    if (uwInFlight === request) uwInFlight = null;
+  }
 }
 
 // ── Weight verification display ───────────────────────────────────────────
@@ -715,6 +791,19 @@ async function pollStatus() {
         console.debug('[poll] package switched', activePackageId, '→', data.active_package);
         await applyPackageSwitch(data.active_package);
         return;
+      }
+    }
+
+    // The backend clears counts that belong to a superseded package; drop
+    // whatever is still painted so the table cannot outlive its package.
+    if (data.result_stale) {
+      console.debug('[poll] result is stale (package '
+        + data.result_package_id + ' gen ' + data.result_model_generation + ')');
+      if (Object.keys(lastCounts).length) {
+        lastCounts = {};
+        rerenderTable({});
+        setUpdateTime('');
+        resetWeightDisplay();
       }
     }
 

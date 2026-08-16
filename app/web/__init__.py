@@ -119,6 +119,34 @@ def reset_latest_state() -> None:
         })
 
 
+def _on_package_switched(_state) -> None:
+    """Clear application state INSIDE the switch transaction.
+
+    Registered with ModelManager so it runs while the lifecycle gate is still
+    held.  Doing it afterwards, from the HTTP route, leaves a window in which
+    the manager already reports package B while latest_state and the camera
+    still hold package A's counts — and any request landing in that window
+    would combine them.
+    """
+    with state_lock:
+        latest_state.update({
+            "timestamp": "",
+            "counts": {},
+            "weight": None,
+            "annotated_b64": None,
+            "weight_verification": None,
+            "package_id": None,
+            "package_display_name": None,
+            "model_generation": model_manager.generation,
+        })
+    cam = camera_thread
+    if cam is not None:
+        cam.invalidate_results()
+
+
+model_manager.add_switch_listener(_on_package_switched)
+
+
 # ── Package-scoped inventory accessors ───────────────────────────────────────
 # Always fetch through these.  Holding on to a dict returned by the profile is
 # fine (it is a copy); holding a reference to the profile itself across a

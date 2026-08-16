@@ -434,3 +434,94 @@ def test_fully_configured_package_is_unaffected():
     assert wv["expected"] == 205.0
     assert wv["ready"] is True
     assert wv["passed"] is True
+
+
+# ── SI-PLATFORM-003: the 2.5 s window sized for a ~2.2 Hz scale ─────────────
+
+def test_production_default_window_is_sized_for_the_measured_scale_rate():
+    """The scale on this unit was measured emitting ~2.2 Hz, not 10 Hz.
+
+    A 1.5 s window needed 3 samples spanning 0.75 s, which at that rate is
+    exactly the 3-sample minimum with no margin: one dropped line and the
+    reading would never settle.
+    """
+    import app.config as config
+
+    assert config.SCALE_STABLE_WINDOW_SEC == 2.5
+    assert config.SCALE_STABLE_MIN_SAMPLES == 3          # not weakened to 1 or 2
+    assert config.SCALE_STABLE_MIN_COVERAGE_RATIO == 0.5
+
+    required_coverage = (config.SCALE_STABLE_WINDOW_SEC
+                         * config.SCALE_STABLE_MIN_COVERAGE_RATIO)
+    measured_rate = 2.2
+    samples_needed = required_coverage * measured_rate + 1
+    assert samples_needed >= 3.5, "no margin above the minimum sample count"
+    assert samples_needed <= config.SCALE_STABLE_WINDOW_SEC * measured_rate
+
+
+@pytest.mark.parametrize("rate_hz", [2.0, 2.2, 2.5, 10.0])
+def test_scale_settles_at_the_rates_this_hardware_produces(rate_hz):
+    """A steady reading must actually reach stable at each plausible rate."""
+    tracker, clock = make_tracker(window_sec=2.5)
+    step = 1.0 / rate_hz
+
+    elapsed = 0.0
+    while elapsed < 6.0 and not tracker.snapshot().stable:
+        tracker.add(50.0)
+        clock.advance(step)
+        elapsed += step
+
+    sample = tracker.snapshot()
+    assert sample.stable is True, "never settled at %.1f Hz" % rate_hz
+    assert elapsed <= 2.5, "took %.2fs to settle at %.1f Hz" % (elapsed, rate_hz)
+
+
+def test_slow_scale_settles_within_a_usable_time():
+    """At the measured 2.2 Hz the operator should not wait more than ~2 s."""
+    tracker, clock = make_tracker(window_sec=2.5)
+    step = 1.0 / 2.2
+    elapsed = 0.0
+    while not tracker.snapshot().stable:
+        tracker.add(120.0)
+        clock.advance(step)
+        elapsed += step
+        assert elapsed < 5.0, "did not settle"
+
+    assert 1.0 <= elapsed <= 2.5
+    assert tracker.snapshot().sample_count >= 3
+
+
+def test_wider_window_still_rejects_a_burst_followed_by_silence():
+    tracker, clock = make_tracker(window_sec=2.5)
+    for _ in range(6):
+        tracker.add(50.0)
+        clock.advance(0.001)
+    clock.advance(1.5)          # still fresh, but no new samples
+
+    sample = tracker.snapshot()
+
+    assert sample.fresh is True
+    assert sample.stable is False
+    assert sample.reason == REASON_WARMING_UP
+    assert sample.coverage_sec < 0.05
+
+
+def test_wider_window_still_goes_stale(tmp_path=None):
+    tracker, clock = make_tracker(window_sec=2.5)
+    feed(tracker, clock, [50.0] * 8, step=0.45)
+    assert tracker.snapshot().stable is True
+
+    clock.advance(5.0)
+
+    sample = tracker.snapshot()
+    assert sample.fresh is False
+    assert sample.stable is False
+    assert sample.reason == REASON_STALE
+
+
+def test_serial_reader_uses_the_production_window_by_default():
+    from app.scale_reader import SerialScaleReader
+
+    reader = SerialScaleReader(port="/dev/null")
+    assert reader._tracker.window_sec == 2.5
+    assert reader._tracker.min_samples == 3

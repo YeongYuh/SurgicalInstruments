@@ -84,11 +84,17 @@ SCALE_DEBUG                = os.environ.get("SCALE_DEBUG", "false").lower() == "
 
 # ── Scale stability gate ─────────────────────────────────────────────────────
 # A PASS/FAIL verdict is only issued for a reading that is both fresh and
-# settled.  At the default 10 Hz background poll, a 1.5 s window holds ~15
-# samples; stability needs at least SCALE_STABLE_MIN_SAMPLES of them spanning at
-# least SCALE_STABLE_MIN_COVERAGE_RATIO of the window, with a spread no larger
-# than SCALE_STABLE_RANGE_GRAMS.
-SCALE_STABLE_WINDOW_SEC        = float(os.environ.get("SCALE_STABLE_WINDOW_SEC", "1.5"))
+# settled: at least SCALE_STABLE_MIN_SAMPLES readings spanning at least
+# SCALE_STABLE_MIN_COVERAGE_RATIO of the window, with a spread no larger than
+# SCALE_STABLE_RANGE_GRAMS.
+#
+# The window is 2.5 s, not 1.5 s, because the scale on this unit was measured
+# emitting ~2.2 Hz — far below the 10 Hz the background poll runs at.  A 1.5 s
+# window needed 3 samples covering 0.75 s, which at 2.2 Hz is exactly the
+# 3-sample minimum with no margin: one dropped or non-numeric line and the
+# reading would never settle.  2.5 s asks for ~1.25 s of coverage, which that
+# rate supplies with 4 samples.
+SCALE_STABLE_WINDOW_SEC        = float(os.environ.get("SCALE_STABLE_WINDOW_SEC", "2.5"))
 SCALE_STABLE_RANGE_GRAMS       = float(os.environ.get("SCALE_STABLE_RANGE_GRAMS", "1.0"))
 SCALE_STABLE_MIN_SAMPLES       = int(os.environ.get("SCALE_STABLE_MIN_SAMPLES", "3"))
 # Beyond this age the cached reading is reported fresh=false — a cached value

@@ -768,7 +768,7 @@ SERIAL_PORT=/dev/ttyACM0 ./run_jetson.sh
 
 | 變數 | 預設值 | 說明 |
 |------|--------|------|
-| `SCALE_STABLE_WINDOW_SEC` | `1.5` | 判定穩定的時間視窗 |
+| `SCALE_STABLE_WINDOW_SEC` | `2.5` | 判定穩定的時間視窗（依實測電子秤約 2.2 Hz 設定） |
 | `SCALE_STABLE_RANGE_GRAMS` | `1.0` | 視窗內允許的最大波動（公克） |
 | `SCALE_STABLE_MIN_SAMPLES` | `3` | 視窗內最少樣本數 |
 | `SCALE_MAX_SAMPLE_AGE_SEC` | `2.0` | 超過此秒數的快取讀值視為 `fresh=false` |

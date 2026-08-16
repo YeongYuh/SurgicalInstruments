@@ -120,6 +120,11 @@ class FakeAdapter(ModelAdapter):
 
     def _do_unload(self) -> None:
         self.unload_calls += 1
+        if self.options.get("fail_unload"):
+            # Raise BEFORE releasing: a teardown that failed has, by
+            # definition, not freed the model, and the resident counter must
+            # reflect that or the test would not prove anything.
+            raise AdapterError("simulated unload failure for package '%s'" % self.package.id)
         self._model_handle = None
         RESIDENT.release()
 
@@ -199,9 +204,25 @@ class ModellessAdapter(FakeAdapter):
         RESIDENT.acquire()
 
 
+class ClassListingAdapter(FakeAdapter):
+    """Publishes a fixed model class list, like a real YOLO model does.
+
+    Needed to exercise the compatibility check, which is deliberately skipped
+    for adapters that cannot say what their model can recognise.
+    """
+
+    name = "class_listing"
+
+    def _describe(self):
+        info = super()._describe()
+        info.class_names = [str(c) for c in self.options.get("model_classes", [])]
+        return info
+
+
 register_adapter("fake", FakeAdapter, replace=True)
 register_adapter("counts_only", CountsOnlyAdapter, replace=True)
 register_adapter("modelless", ModellessAdapter, replace=True, requires_model_file=False)
+register_adapter("class_listing", ClassListingAdapter, replace=True)
 
 
 @pytest.fixture(autouse=True)
