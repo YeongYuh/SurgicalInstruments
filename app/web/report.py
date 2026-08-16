@@ -20,9 +20,11 @@ def generate_csv(records: Sequence[Mapping[str, Any]],
     """
     buf = io.StringIO()
     writer = csv.writer(buf)
+    # preset_id is appended LAST on purpose: existing consumers index the
+    # earlier columns positionally, and inserting a column would shift them.
     writer.writerow([
         "timestamp", "source", "package_id", "package_name",
-        "class_name", "detected", "standard", "status", "weight_g",
+        "class_name", "detected", "standard", "status", "weight_g", "preset_id",
     ])
 
     for rec in records:
@@ -33,6 +35,7 @@ def generate_csv(records: Sequence[Mapping[str, Any]],
         weight_str = f"{weight:.2f}" if isinstance(weight, (int, float)) else ""
         pkg_id = rec.get("package_id") or ""
         pkg_name = rec.get("package_display_name") or ""
+        preset_id = rec.get("preset_id") or ""
         rec_standards = record_standards(rec, standards)
 
         # Union of expected and detected — see app/inventory.py.  An instrument
@@ -40,13 +43,15 @@ def generate_csv(records: Sequence[Mapping[str, Any]],
         # alone would drop the single most important row in the report.
         rows = compare_inventory(counts, rec_standards)
         if not rows:
-            writer.writerow([ts, source, pkg_id, pkg_name, "", 0, "", "", weight_str])
+            writer.writerow([ts, source, pkg_id, pkg_name, "", 0, "", "",
+                             weight_str, preset_id])
             continue
 
         for row in rows:
             writer.writerow([
                 ts, source, pkg_id, pkg_name,
-                row.class_name, row.detected, row.standard, row.status, weight_str,
+                row.class_name, row.detected, row.standard, row.status,
+                weight_str, preset_id,
             ])
 
     return buf.getvalue()

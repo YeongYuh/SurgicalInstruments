@@ -581,6 +581,7 @@ class CameraThread(threading.Thread):
                     standards_snapshot=std_snap,
                     package_id=session.package_id,
                     package_display_name=session.display_name,
+                    preset_id=session.preset_id,
                     model_identity=(result.model_info.identity()
                                     if result.model_info else None),
                     class_weights_snapshot=class_weights,

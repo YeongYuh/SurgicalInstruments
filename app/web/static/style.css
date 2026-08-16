@@ -65,6 +65,29 @@ body {
 
 #package-select:disabled { opacity: 0.55; cursor: progress; }
 
+/* Surgery preset — only shown for packages that define named trays */
+#preset-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 8px;
+  border-left: 1px solid #2d3448;
+}
+
+#preset-select {
+  background: #21262d;
+  color: #c9d1d9;
+  border: 1px solid #2d3448;
+  border-radius: 5px;
+  padding: 3px 8px;
+  font-size: 12px;
+  max-width: 180px;
+}
+
+#preset-select:disabled { opacity: 0.55; cursor: progress; }
+#preset-weight { font-size: 11px; color: #8b949e; white-space: nowrap; }
+#preset-weight.modified { color: #d0a215; }
+
 #package-status { font-size: 11px; min-width: 60px; }
 #package-status.busy   { color: #d0a215; }
 #package-status.error  { color: #f44336; }

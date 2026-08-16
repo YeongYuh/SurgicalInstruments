@@ -89,6 +89,7 @@ class ModelPackage:
         class_weights_path: Optional[Path] = None,
         default_standards_path: Optional[Path] = None,
         default_unit_weights_path: Optional[Path] = None,
+        presets_path: Optional[Path] = None,
         is_template: bool = False,
         raw: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -108,6 +109,7 @@ class ModelPackage:
         self.class_weights_path = class_weights_path
         self.default_standards_path = default_standards_path
         self.default_unit_weights_path = default_unit_weights_path
+        self.presets_path = presets_path
         self.is_template = is_template
         self.raw = raw or {}
 
@@ -172,6 +174,21 @@ class ModelPackage:
         return _load_number_map(self.default_unit_weights_path, "default_unit_weights",
                                 cast=float)
 
+    @property
+    def has_presets(self) -> bool:
+        return bool(self.presets_path and self.presets_path.exists())
+
+    def load_presets(self) -> Dict[str, Dict[str, int]]:
+        """Named standard trays this package offers, e.g. one per surgery type.
+
+        Optional: a package with a single fixed tray simply declares none, and
+        the UI shows no preset selector for it.  Read-only factory data — the
+        operator's edits go to the profile, never back into the package.
+        """
+        if self.presets_path is None:
+            return {}
+        return _load_presets(self.presets_path)
+
     # ── misc ──────────────────────────────────────────────────────────────
 
     def summary(self) -> Dict[str, Any]:
@@ -231,6 +248,82 @@ def _load_number_map(path: Path, field: str, cast=float,
                 "%s: value for '%s' must be a whole number, got %r" % (field, key, value))
         out[key] = cast(value)
     return out
+
+
+def _load_presets(path: Path) -> Dict[str, Dict[str, int]]:
+    """Parse a preset file: {preset name: {class name: quantity}}.
+
+    Held to the same strictness as standards anywhere else — a fractional or
+    non-finite quantity is a mistake, not something to round.
+    """
+    if not path.exists():
+        raise ModelPackageError("presets file not found: %s" % path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ModelPackageError("presets file is not valid JSON (%s): %s" % (path, exc))
+    if not isinstance(data, dict):
+        raise ModelPackageError("presets file must contain a JSON object: %s" % path)
+
+    presets: Dict[str, Dict[str, int]] = {}
+    for name, items in data.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ModelPackageError("presets: preset names must be non-empty strings (%s)"
+                                    % path)
+        if not isinstance(items, dict):
+            raise ModelPackageError(
+                "presets: '%s' must map class names to quantities (%s)" % (name, path))
+        parsed: Dict[str, int] = {}
+        for cls, qty in items.items():
+            if not isinstance(cls, str) or not cls.strip():
+                raise ModelPackageError(
+                    "presets: '%s' has an empty class name (%s)" % (name, path))
+            if isinstance(qty, bool) or not isinstance(qty, (int, float)):
+                raise ModelPackageError(
+                    "presets: '%s'/'%s' quantity must be a number, got %r"
+                    % (name, cls, qty))
+            if not math.isfinite(float(qty)):
+                raise ModelPackageError(
+                    "presets: '%s'/'%s' quantity must be finite, got %r" % (name, cls, qty))
+            if qty < 0:
+                raise ModelPackageError(
+                    "presets: '%s'/'%s' quantity must not be negative" % (name, cls))
+            if float(qty) != int(qty):
+                raise ModelPackageError(
+                    "presets: '%s'/'%s' quantity must be a whole number, got %r"
+                    % (name, cls, qty))
+            parsed[cls.strip()] = int(qty)
+        presets[name.strip()] = parsed
+    if not presets:
+        raise ModelPackageError("presets file defines no presets: %s" % path)
+    return presets
+
+
+def _cross_validate_presets(presets: Mapping[str, Mapping[str, int]],
+                            class_weights: Mapping[str, float],
+                            where: str) -> None:
+    """Every instrument a preset expects must have a usable unit weight.
+
+    Same rule as the package's default standards: a preset that silently omits
+    an instrument's weight would under-report the expected total for that tray.
+    """
+    problems = []
+    for name, items in presets.items():
+        missing = sorted(cls for cls, qty in items.items()
+                         if int(qty or 0) > 0 and not _usable_class_weight(
+                             class_weights.get(cls)))
+        if missing:
+            problems.append("%s: %s" % (name, ", ".join(missing)))
+    if problems:
+        raise ModelPackageError(
+            "%s: preset instruments have no usable class weight — %s"
+            % (where, "; ".join(problems)))
+
+
+def _usable_class_weight(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value)) and float(value) > 0
 
 
 def _cross_validate_inventory(standards: Mapping[str, int],
@@ -389,6 +482,16 @@ def load_manifest(
         default_unit_weights_path = _resolve_path(
             raw_uw.strip(), "inventory.default_unit_weights", package_root, project_root)
 
+    # Optional: named standard trays (e.g. one per surgery type).  A package
+    # without them simply has one fixed tray and no preset selector.
+    presets_path: Optional[Path] = None
+    raw_presets = inventory.get("presets")
+    if raw_presets is not None:
+        _require(isinstance(raw_presets, str) and raw_presets.strip(),
+                 "'inventory.presets' must be a non-empty string")
+        presets_path = _resolve_path(raw_presets.strip(), "inventory.presets",
+                                     package_root, project_root)
+
     package = ModelPackage(
         package_id=package_id,
         display_name=display_name,
@@ -406,6 +509,7 @@ def load_manifest(
         class_weights_path=class_weights_path,
         default_standards_path=default_standards_path,
         default_unit_weights_path=default_unit_weights_path,
+        presets_path=presets_path,
         is_template=is_template,
         raw=data,
     )
@@ -413,14 +517,32 @@ def load_manifest(
     # A template is a fill-in-the-blanks skeleton: its referenced data files are
     # not expected to exist yet, so they are not read.  It can be listed but
     # never activated.
-    if not is_template:
+    # A template's referenced files may not exist yet, so they are not required.
+    # Any that DO exist are still validated: half-filled demo data should fail
+    # here, while it is being prepared, not on the ward.
+    def _present(path: Optional[Path]) -> bool:
+        return path is not None and path.exists()
+
+    check_class_weights = not is_template or _present(class_weights_path)
+    class_weights: Dict[str, float] = {}
+    if check_class_weights:
         class_weights = package.load_class_weights()   # raises if missing / malformed
-        if default_standards_path is not None:
-            default_standards = package.load_default_standards()  # raises if malformed
+
+    if (not is_template or _present(default_standards_path)) \
+            and default_standards_path is not None:
+        default_standards = package.load_default_standards()  # raises if malformed
+        if check_class_weights:
             _cross_validate_inventory(default_standards, class_weights,
                                       "inventory.default_standards")
-        if default_unit_weights_path is not None:
-            package.load_default_unit_weights()
+
+    if (not is_template or _present(default_unit_weights_path)) \
+            and default_unit_weights_path is not None:
+        package.load_default_unit_weights()
+
+    if (not is_template or _present(presets_path)) and presets_path is not None:
+        presets = package.load_presets()               # raises if malformed
+        if check_class_weights:
+            _cross_validate_presets(presets, class_weights, "inventory.presets")
 
     return package
 

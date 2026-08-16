@@ -47,6 +47,7 @@ def make_record(
     *,
     package_id: Optional[str] = None,
     package_display_name: Optional[str] = None,
+    preset_id: Optional[str] = None,
     model_identity: Optional[Mapping[str, Any]] = None,
     class_weights_snapshot: Optional[Mapping[str, float]] = None,
     weight_verification: Optional[Mapping[str, Any]] = None,
@@ -68,6 +69,9 @@ def make_record(
         "standards_snapshot": standards_snapshot,
         "package_id": package_id,
         "package_display_name": package_display_name,
+        # Which named tray (surgery type) was selected, when the package offers
+        # them.  None for packages with a single fixed tray.
+        "preset_id": preset_id,
     }
     if model_identity:
         record["model"] = dict(model_identity)

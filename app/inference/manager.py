@@ -227,6 +227,12 @@ class InferenceSession:
     def class_weights(self) -> Dict[str, float]:
         return self.state.class_weights
 
+    @property
+    def preset_id(self) -> Optional[str]:
+        """The named tray these standards came from, if any."""
+        profile = self.state.profile
+        return profile.active_preset if profile is not None else None
+
     def infer(self, image: Any, conf: Optional[float] = None,
               imgsz: Optional[int] = None) -> InferenceResult:
         adapter = self.state.adapter
@@ -901,6 +907,75 @@ class ModelManager:
             raise ProfileValidationError(
                 "無法設定標準數量 — " + "；".join(problems),
                 invalid=sorted(set(unknown) | set(unpriced)))
+
+    # ── inventory presets (named trays, e.g. one per surgery type) ────────
+    #
+    # A preset changes only WHAT IS EXPECTED, never which model runs.  It is
+    # deliberately not a package switch: no adapter is touched, no model is
+    # loaded, and the generation does not advance.
+
+    def preset_overview(self) -> Dict[str, Any]:
+        """Presets offered by the active package, with each tray's total weight."""
+        with self._state_lock:
+            package = self._package
+            profile = self._profile
+        if package is None or profile is None:
+            return {"package_id": None, "active_preset": None,
+                    "preset_modified": False, "presets": []}
+
+        class_weights = profile.class_weights
+        entries = []
+        for name in profile.preset_names:
+            items = profile.preset_standards(name)
+            expected = 0.0
+            for cls, qty in items.items():
+                weight = class_weights.get(cls)
+                if int(qty or 0) > 0 and _usable_weight(weight):
+                    expected += int(qty) * float(weight)
+            entries.append({
+                "id": name,
+                "display_name": name,
+                "instrument_count": sum(int(q or 0) for q in items.values()),
+                "class_count": len(items),
+                "expected_weight": round(expected, 4),
+            })
+        return {
+            "package_id": package.id,
+            "active_preset": profile.active_preset,
+            "preset_modified": profile.preset_is_modified(),
+            "presets": entries,
+        }
+
+    def apply_preset(self, preset_id: str, *,
+                     package_id: Optional[str] = None) -> Dict[str, Any]:
+        """Select a named tray for the active package.
+
+        Validated against the active model's class list when it has one: a tray
+        expecting an instrument this model cannot detect could never be
+        completed, and the operator should find out on selection.
+        """
+        with self._state_lock:
+            active_id = self._package.id if self._package else None
+            if package_id is not None and package_id != active_id:
+                raise PackageMismatchError(package_id, active_id)
+            profile = self._profile
+            if profile is None:
+                raise ModelManagerError("no active model package — cannot select a preset")
+            if not profile.has_presets:
+                raise ProfileValidationError(
+                    "package '%s' offers no surgery presets" % active_id)
+            if preset_id not in profile.preset_names:
+                raise ProfileValidationError(
+                    "unknown preset '%s' — available: %s"
+                    % (preset_id, ", ".join(profile.preset_names)))
+
+            items = profile.preset_standards(preset_id)
+            self._validate_standards_edit(items, profile, self._adapter)
+            profile.apply_preset(preset_id)
+        logger.info("[models] package '%s' switched to preset '%s' "
+                    "(model unchanged, generation=%d)",
+                    active_id, preset_id, self.generation)
+        return self.preset_overview()
 
     def update_active_profile(self, kind: str, values: Dict[str, Any], *,
                               package_id: Optional[str] = None) -> Dict[str, Any]:

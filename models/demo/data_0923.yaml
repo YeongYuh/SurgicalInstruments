@@ -1,0 +1,13 @@
+train: ../train_0923/images
+val: ../valid_0923/images
+test: ../test_0923/images
+
+nc: 17
+names: ['Adson-Smooth-Tissue-Forceps', 'Adson-Teeth-Tissue-Forceps', 'Allis-Grasping-Forceps', 'Kelly-Forceps-Cvd.', 'Kelly-Forceps-Str.', 'Knife-Handle-No.3', 'Mayo Scissors Cvd', 'Mayo-Hegar-Needle-Holder-TC', 'Metzenbaum-Scissors', 'Mosquito-Forceps-Cvd.', 'Patten Retractor', 'Ring-Forceps', 'Smooth-Tissue-Forceps', 'Suction-Tube-Fr.12', 'Suture-Scissors-B-S-Str.', 'Teeth-Tissue-Forceps', 'Towel-Clamp']
+
+roboflow:
+  workspace: project-mw0yo
+  project: -_segmentation
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/project-mw0yo/-_segmentation/dataset/2

@@ -1,0 +1,33 @@
+{
+  "SurgeryA": {
+    "Adson-Smooth-Tissue-Forceps": 1,
+    "Adson-Teeth-Tissue-Forceps": 1,
+    "Mayo Scissors Cvd": 1,
+    "Patten Retractor": 1,
+    "Ring-Forceps": 1,
+    "Smooth-Tissue-Forceps": 1,
+    "Towel-Clamp": 2
+  },
+  "SurgeryB": {
+    "Adson-Smooth-Tissue-Forceps": 2,
+    "Mayo Scissors Cvd": 2,
+    "Towel-Clamp": 1
+  },
+  "SurgeryC": {
+    "Knife-Handle-No.3": 1,
+    "Allis-Grasping-Forceps": 1,
+    "Patten Retractor": 1,
+    "Teeth-Tissue-Forceps": 1
+  },
+  "SurgeryD": {
+    "Knife-Handle-No.3": 1,
+    "Allis-Grasping-Forceps": 1,
+    "Patten Retractor": 1,
+    "Suction-Tube-Fr.12": 1,
+    "Suture-Scissors-B-S-Str.": 1,
+    "Kelly-Forceps-Str.": 1,
+    "Adson-Teeth-Tissue-Forceps": 1,
+    "Mosquito-Forceps-Cvd.": 1,
+    "Towel-Clamp": 2
+  }
+}

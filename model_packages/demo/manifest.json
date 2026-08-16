@@ -25,6 +25,7 @@
 
   "inventory": {
     "class_weights": "model_packages/demo/class_weight.json",
-    "default_standards": "model_packages/demo/standards.json"
+    "default_standards": "model_packages/demo/standards.json",
+    "presets": "model_packages/demo/surgery_instruments.json"
   }
 }

@@ -190,6 +190,7 @@ def _run_image_inference(image_bgr: np.ndarray, source_label: str) -> dict:
                 standards_snapshot=std_snap,
                 package_id=session.package_id,
                 package_display_name=session.display_name,
+                preset_id=session.preset_id,
                 model_identity=(result.model_info.identity() if result.model_info else None),
                 class_weights_snapshot=class_weights,
                 weight_verification=wv,
@@ -702,6 +703,13 @@ def status():
         # True once a model could not be released: nothing more will load until
         # the service restarts.
         "recovery_required": manager.recovery_required,
+        # Which named tray is selected, and whether it has been hand-edited.
+        "active_preset": (model_state.profile.active_preset
+                          if model_state.profile is not None else None),
+        "preset_modified": (model_state.profile.preset_is_modified()
+                            if model_state.profile is not None else False),
+        "has_presets": (model_state.profile.has_presets
+                        if model_state.profile is not None else False),
     })
     return jsonify(payload)
 
@@ -854,6 +862,66 @@ def api_model_package_post():
         recognition_stopped=was_recognizing,
         recognition_resumed=resumed,
         **manager.model_info(),
+    )
+
+
+# ── Inventory presets (surgery types) ────────────────────────────────────────
+
+@app.route("/api/inventory-presets")
+def api_inventory_presets():
+    """Named standard trays offered by the ACTIVE package.
+
+    A package without presets returns an empty list, and the UI hides the
+    selector — ortho_tka has one fixed tray and should not grow a control that
+    does nothing.
+    """
+    return jsonify(ok=True, **web_pkg.model_manager.preset_overview())
+
+
+@app.route("/api/inventory-preset", methods=["POST"])
+def api_inventory_preset_post():
+    """Select a surgery preset: swap what is expected, not which model runs.
+
+    No adapter is touched and the model generation does not advance — this is
+    not a package switch.  The previous inference IS invalidated though: counts
+    taken for SurgeryA must not be re-judged against SurgeryB's tray, even
+    though the same model produced them.
+    """
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not data.get("id"):
+        return jsonify(ok=False, error="Expected JSON object with an 'id' field"), 400
+    preset_id = str(data["id"])
+    package_id = data.get("package_id") or request.headers.get("X-Model-Package") or None
+
+    manager = web_pkg.model_manager
+    generation_before = manager.generation
+    try:
+        overview = manager.apply_preset(preset_id, package_id=package_id)
+    except PackageMismatchError as exc:
+        return _mismatch_response(exc)
+    except ProfileValidationError as exc:
+        return jsonify(ok=False, error=str(exc), invalid=exc.invalid), 400
+    except ModelManagerError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
+
+    # Invalidate the camera first: it bumps the recognition generation, so an
+    # inference already in flight fails its commit instead of landing after the
+    # reset.  Then clear the published state.
+    with web_pkg.state_lock:
+        cam = web_pkg.camera_thread
+    if cam is not None:
+        cam.invalidate_results()
+    web_pkg.reset_latest_state()
+
+    logger.info("[preset] '%s' applied (generation unchanged at %d)",
+                preset_id, manager.generation)
+    return jsonify(
+        ok=True,
+        status="preset_applied",
+        model_generation=manager.generation,
+        model_reloaded=(manager.generation != generation_before),
+        standards=web_pkg.get_standards(),
+        **overview,
     )
 
 

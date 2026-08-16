@@ -21,7 +21,7 @@ import logging
 import os
 import threading  # noqa: F401  (used by save_json_atomic for a unique temp name)
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from app.inference.package import ModelPackage
 from app.validation import clean_loaded_quantity, clean_loaded_weight
@@ -104,13 +104,19 @@ class PackageProfile:
         class_weights: Dict[str, float],
         standards_path: Path,
         unit_weights_path: Path,
+        presets: Optional[Dict[str, Dict[str, int]]] = None,
+        preset_path: Optional[Path] = None,
+        active_preset: Optional[str] = None,
     ) -> None:
         self.package_id = package_id
         self.standards_path = standards_path
         self.unit_weights_path = unit_weights_path
+        self.preset_path = preset_path
         self._standards = dict(standards)
         self._unit_weights = dict(unit_weights)
         self._class_weights = dict(class_weights)  # read-only after construction
+        self._presets = {name: dict(items) for name, items in (presets or {}).items()}
+        self._active_preset = active_preset if active_preset in self._presets else None
         self._lock = threading.Lock()
 
     # ── reads (always return copies; callers must not hold a live reference) ──
@@ -129,6 +135,53 @@ class PackageProfile:
     def class_weights(self) -> Dict[str, float]:
         return dict(self._class_weights)
 
+    # ── presets (named standard trays, e.g. one per surgery type) ─────────
+
+    @property
+    def has_presets(self) -> bool:
+        return bool(self._presets)
+
+    @property
+    def preset_names(self) -> List[str]:
+        return list(self._presets)
+
+    @property
+    def active_preset(self) -> Optional[str]:
+        with self._lock:
+            return self._active_preset
+
+    def preset_standards(self, preset_id: str) -> Dict[str, int]:
+        """The factory tray for ``preset_id`` — the raw, non-canonical form."""
+        return dict(self._presets[preset_id])
+
+    def canonical_standards_for(self, preset_id: str) -> Dict[str, int]:
+        """What the profile's standards become when this preset is applied.
+
+        Every class the package knows about is listed, so the table can show the
+        full instrument set; the ones this tray does not use are 0 rather than
+        absent.  That is what makes applying a preset a REPLACE — no quantity
+        from the previously selected surgery can survive as a leftover key.
+        """
+        selected = self._presets.get(preset_id, {})
+        with self._lock:
+            known = set(self._class_weights) | set(self._standards)
+        for items in self._presets.values():
+            known |= set(items)
+        return {cls: int(selected.get(cls, 0)) for cls in sorted(known)}
+
+    def preset_is_modified(self, preset_id: Optional[str] = None) -> bool:
+        """Has the operator edited the standards away from the chosen preset?
+
+        Compared against exactly what selecting that preset would produce, so a
+        manual edit is detected without guessing.
+        """
+        target = preset_id if preset_id is not None else self.active_preset
+        if target is None or target not in self._presets:
+            return False
+        expected = self.canonical_standards_for(target)
+        current = self.standards
+        return {k: v for k, v in current.items() if v} != {k: v for k, v in expected.items() if v}
+
     # ── writes ────────────────────────────────────────────────────────────
 
     # Every mutation holds the lock across mutate -> snapshot -> write.  Doing
@@ -143,6 +196,46 @@ class PackageProfile:
             snapshot = dict(self._standards)
             save_json_atomic(self.standards_path, snapshot)
         return snapshot
+
+    def replace_standards(self, values: Mapping[str, Any]) -> Dict[str, int]:
+        """Replace the standards wholesale — NOT a merge.
+
+        ``update_standards`` merges, which is right for an operator editing one
+        row.  It is wrong for switching trays: merging SurgeryB over SurgeryA
+        would leave SurgeryA's Ring-Forceps and Patten Retractor still expected,
+        and the tray would be reported incomplete for instruments this surgery
+        never uses.
+        """
+        parsed = _coerce_ints(values)
+        with self._lock:
+            self._standards = parsed
+            snapshot = dict(self._standards)
+            save_json_atomic(self.standards_path, snapshot)
+        return snapshot
+
+    def apply_preset(self, preset_id: str) -> Dict[str, int]:
+        """Select a named tray: replace the standards and remember the choice."""
+        if preset_id not in self._presets:
+            raise KeyError(preset_id)
+        canonical = self.canonical_standards_for(preset_id)
+        with self._lock:
+            self._standards = dict(canonical)
+            self._active_preset = preset_id
+            save_json_atomic(self.standards_path, dict(self._standards))
+            self._persist_preset_locked()
+        logger.info("[profile] %s: applied preset '%s' (%d expected instruments)",
+                    self.package_id, preset_id, sum(canonical.values()))
+        return canonical
+
+    def clear_preset(self) -> None:
+        with self._lock:
+            self._active_preset = None
+            self._persist_preset_locked()
+
+    def _persist_preset_locked(self) -> None:
+        if self.preset_path is None:
+            return
+        save_json_atomic(self.preset_path, {"active_preset": self._active_preset})
 
     def update_unit_weights(self, values: Mapping[str, Any]) -> Dict[str, float]:
         parsed = _coerce_floats(values)
@@ -198,9 +291,35 @@ def load_profile(
     profile_dir = Path(profiles_dir) / package.id
     standards_path = profile_dir / "standards.json"
     unit_weights_path = profile_dir / "unit_weights.json"
+    preset_path = profile_dir / "preset.json"
     is_legacy = legacy_package_id is not None and package.id == legacy_package_id
 
-    class_weights = package.load_class_weights() if not package.is_template else {}
+    class_weights: Dict[str, float] = {}
+    if not package.is_template or (package.class_weights_path
+                                   and package.class_weights_path.exists()):
+        try:
+            class_weights = package.load_class_weights()
+        except Exception as exc:  # noqa: BLE001 - already validated at discovery
+            logger.warning("[profile] %s: cannot read class weights: %s", package.id, exc)
+
+    presets: Dict[str, Dict[str, int]] = {}
+    if package.has_presets:
+        try:
+            presets = package.load_presets()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[profile] %s: cannot read presets: %s", package.id, exc)
+
+    # The operator's last surgery choice, restored across restarts.  A preset
+    # that no longer exists in the package resolves to None rather than crashing.
+    stored_preset = None
+    raw_preset = _read_json_dict(preset_path)
+    if raw_preset is not None:
+        candidate = raw_preset.get("active_preset")
+        if isinstance(candidate, str) and candidate in presets:
+            stored_preset = candidate
+        elif candidate is not None:
+            logger.warning("[profile] %s: stored preset %r is no longer defined",
+                           package.id, candidate)
 
     # ── standards ────────────────────────────────────────────────────────
     standards_source = "profile"
@@ -250,6 +369,9 @@ def load_profile(
         class_weights=class_weights,
         standards_path=standards_path,
         unit_weights_path=unit_weights_path,
+        presets=presets,
+        preset_path=preset_path,
+        active_preset=stored_preset,
     )
 
     # Persist whatever we seeded so the next start reads it back from the profile.
@@ -259,8 +381,10 @@ def load_profile(
         save_json_atomic(unit_weights_path, unit_weights)
 
     logger.info(
-        "[profile] %s ready — standards=%d (%s)  unit_weights=%d (%s)  class_weights=%d",
+        "[profile] %s ready — standards=%d (%s)  unit_weights=%d (%s)  "
+        "class_weights=%d  presets=%d (active=%s)",
         package.id, len(standards), standards_source,
         len(unit_weights), uw_source, len(class_weights),
+        len(presets), stored_preset or "none",
     )
     return profile

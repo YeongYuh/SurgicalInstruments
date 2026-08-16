@@ -12,6 +12,17 @@
 | 每類單重 | `model_packages/demo/class_weight.json` | `{"類別名稱": 公克數, ...}`，類別名稱必須與模型輸出一致 |
 | 標準數量 | `model_packages/demo/standards.json` | `{"類別名稱": 應有數量, ...}`，出廠預設值 |
 
+已隨套件附上（不需你再建立）：
+
+| 檔案 | 內容 |
+|---|---|
+| `class_weight.json` | 17 種器械的實際單重（公克） |
+| `surgery_instruments.json` | SurgeryA–D 四種手術的標準器械盤 |
+
+> **手術類型的器械名稱必須與模型輸出的 class name 逐字元相同。**
+> 不相同時，選擇該手術類型會被拒絕（因為那盤器械永遠不可能點齊），
+> 而不是默默顯示成「缺少」。拿到模型後第一件事是比對 class names。
+
 > 只有模型、還沒有重量與標準數量時：可先讓 `standards.json` 全部填 0，
 > `class_weight.json` 只填真正有資料的類別。辨識與盤點可以先跑，重量驗證會顯示
 > 「尚未設定標準重量」而不是假的 PASS/FAIL。**不要為了讓它變綠色而編數字。**

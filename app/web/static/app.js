@@ -34,6 +34,9 @@ let cameraStopPending       = false;  // true while camera stop is in-flight / u
 let cameraStartPending      = false;  // true while /camera/start fetch is in-flight
 let activePackageId         = null;   // id of the active model package
 let availablePackages       = [];     // /api/model-packages payload
+let activePreset            = null;   // selected surgery preset, if the package has any
+let availablePresets        = [];     // /api/inventory-presets payload
+let presetModified          = false;  // standards hand-edited away from the preset
 
 // ── Init ──────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', async () => {
@@ -45,6 +48,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   console.debug('[init] app start CLIENT_ID=' + CLIENT_ID);
   initChart();
   await loadPackages();
+  await loadPresets();
   await fetchStandards();
   await fetchUnitWeights();
   await fetchClassWeights();
@@ -283,6 +287,124 @@ function renderPackageSelect() {
   }).join('');
 }
 
+// ── Surgery presets ───────────────────────────────────────────────────────
+// A preset changes only WHAT IS EXPECTED. The model does not reload, the camera
+// keeps running, and the model generation does not advance — this is not a
+// package switch.
+async function loadPresets() {
+  try {
+    const res  = await fetch('/api/inventory-presets');
+    const data = await res.json();
+    availablePresets = data.presets || [];
+    activePreset     = data.active_preset || null;
+    presetModified   = data.preset_modified === true;
+    renderPresetSelect();
+  } catch (e) {
+    console.error('loadPresets:', e);
+  }
+}
+
+function renderPresetSelect() {
+  const group  = document.getElementById('preset-group');
+  const select = document.getElementById('preset-select');
+  const weight = document.getElementById('preset-weight');
+  if (!group || !select) return;
+
+  // Packages with one fixed tray get no control at all, rather than a dead one.
+  if (!availablePresets.length) {
+    group.style.display = 'none';
+    select.innerHTML = '';
+    if (weight) weight.textContent = '';
+    return;
+  }
+
+  group.style.display = 'flex';
+  select.innerHTML = availablePresets.map(p => {
+    const selected = p.id === activePreset ? ' selected' : '';
+    return `<option value="${p.id}"${selected}>${p.display_name}</option>`;
+  }).join('');
+  if (activePreset === null) select.selectedIndex = -1;
+
+  if (weight) {
+    const current = availablePresets.find(p => p.id === activePreset);
+    if (!current) {
+      weight.textContent = '尚未選擇';
+      weight.className = '';
+    } else if (presetModified) {
+      // The operator hand-edited the table; say so instead of showing a factory
+      // total that no longer matches what is expected.
+      weight.textContent = `${current.display_name}（已修改）`;
+      weight.className = 'modified';
+    } else {
+      weight.textContent = `標準重量 ${current.expected_weight.toFixed(0)} g`
+        + `  ·  ${current.instrument_count} 支`;
+      weight.className = '';
+    }
+  }
+}
+
+async function onPresetChange(evt) {
+  const select   = evt.target;
+  const targetId = select.value;
+  if (!targetId || (targetId === activePreset && !presetModified)) return;
+
+  const previous = activePreset;
+  select.disabled = true;
+  setPackageStatus('套用手術類型…', 'busy');
+  try {
+    // Same rule as a package switch: a debounced standards edit must land (or
+    // fail loudly) before the tray is replaced under it.
+    const flushed = await flushPendingEdits();
+    if (!flushed.ok) {
+      alert('設定尚未儲存，未切換手術類型：\n' + (flushed.error || '未知錯誤'));
+      select.value = previous || '';
+      setPackageStatus('設定未儲存', 'error');
+      return;
+    }
+
+    const res = await fetch('/api/inventory-preset', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Model-Package': activePackageId || '',
+      },
+      body: JSON.stringify({ id: targetId, package_id: activePackageId }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      alert('切換手術類型失敗：' + (data.error || 'HTTP ' + res.status));
+      select.value = previous || '';
+      setPackageStatus('切換失敗', 'error');
+      await loadPresets();
+      return;
+    }
+
+    activePreset   = data.active_preset || targetId;
+    presetModified = data.preset_modified === true;
+    availablePresets = data.presets || availablePresets;
+    standards = data.standards || standards;
+
+    // The counts were produced for the previous tray; the backend has already
+    // invalidated them, so drop what is on screen too.
+    lastCounts = {};
+    rerenderTable({});
+    setUpdateTime('');
+    resetWeightDisplay();
+    await fetchStandards();
+    await fetchUnitWeights();
+    rerenderTable({});
+    renderPresetSelect();
+    setPackageStatus('已套用', 'ok');
+    setTimeout(() => setPackageStatus('', ''), 3000);
+  } catch (e) {
+    alert('連線錯誤：' + e.message);
+    select.value = previous || '';
+    setPackageStatus('連線錯誤', 'error');
+  } finally {
+    select.disabled = false;
+  }
+}
+
 function setPackageStatus(text, cls) {
   const el = document.getElementById('package-status');
   if (!el) return;
@@ -353,6 +475,8 @@ async function applyPackageSwitch(newId, response) {
   await fetchUnitWeights();
   await fetchClassWeights();
   await loadPackages();
+  // Presets belong to the package, so the selector is rebuilt (or hidden) here.
+  await loadPresets();
   await syncRuntimeState(response);
 }
 

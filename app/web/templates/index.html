@@ -19,6 +19,12 @@
       <div id="package-bar">
         <label for="package-select">器械套件</label>
         <select id="package-select" onchange="onPackageChange(event)"></select>
+        <!-- Hidden entirely for packages with a single fixed tray. -->
+        <span id="preset-group" style="display:none">
+          <label for="preset-select">手術類型</label>
+          <select id="preset-select" onchange="onPresetChange(event)"></select>
+          <span id="preset-weight"></span>
+        </span>
         <span id="package-status"></span>
       </div>
     </header>
