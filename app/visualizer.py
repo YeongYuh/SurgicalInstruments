@@ -22,13 +22,56 @@ _PALETTE = [
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
-def draw_detections(image: np.ndarray, detections: list[dict]) -> np.ndarray:
-    """Draw bounding boxes, class name, and confidence on a copy of image."""
+def _detection_fields(det) -> tuple:
+    """Normalise a Detection dataclass or a plain dict to (bbox, class_id, name, conf).
+
+    ``bbox`` is None for models that do not produce geometry — a classifier or
+    a counts-only model.  Callers must treat it as optional.
+    """
+    if isinstance(det, dict):
+        bbox = det.get("bbox_xyxy", det.get("xyxy"))
+        class_id = det.get("class_id", -1)
+        class_name = det.get("class_name", "")
+        confidence = det.get("confidence", 0.0)
+    else:
+        bbox = getattr(det, "bbox_xyxy", None)
+        class_id = getattr(det, "class_id", -1)
+        class_name = getattr(det, "class_name", "")
+        confidence = getattr(det, "confidence", 0.0)
+
+    if bbox is not None:
+        try:
+            values = list(bbox)
+            bbox = tuple(float(v) for v in values[:4]) if len(values) >= 4 else None
+        except (TypeError, ValueError):
+            bbox = None
+    try:
+        class_id = int(class_id)
+    except (TypeError, ValueError):
+        class_id = -1
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return bbox, class_id, str(class_name), confidence
+
+
+def draw_detections(image: np.ndarray, detections) -> np.ndarray:
+    """Draw bounding boxes, class name, and confidence on a copy of image.
+
+    Detections without geometry are skipped rather than crashing: a counts-only
+    model still has to produce a working inventory result, it just has nothing
+    to draw.  Accepts Detection objects or legacy dicts.
+    """
     annotated = image.copy()
-    for det in detections:
-        x1, y1, x2, y2 = (int(v) for v in det["xyxy"])
-        colour = _PALETTE[det["class_id"] % len(_PALETTE)]
-        label = f"{det['class_name']} {det['confidence']:.2f}"
+    for det in detections or []:
+        bbox, class_id, class_name, confidence = _detection_fields(det)
+        if bbox is None:
+            continue  # counts-only / classification model — nothing to outline
+
+        x1, y1, x2, y2 = (int(v) for v in bbox)
+        colour = _PALETTE[abs(class_id) % len(_PALETTE)]
+        label = f"{class_name} {confidence:.2f}"
 
         cv2.rectangle(annotated, (x1, y1), (x2, y2), colour, 2)
 
@@ -76,8 +119,13 @@ def overlay_runtime_info(
     weight_str = f"{actual_weight:.2f} g" if actual_weight is not None else "N/A"
     lines.append((f"Weight: {weight_str}", white))
 
-    status = "PASS" if weight_result["passed"] else "FAIL"
-    lines.append((f"Status: {status}", green if weight_result["passed"] else red))
+    # passed is None while the reading has not settled — that is "pending",
+    # not a failure, so it must not be painted red.
+    passed = weight_result.get("passed")
+    if passed is None:
+        lines.append(("Status: PENDING", yellow))
+    else:
+        lines.append((f"Status: {'PASS' if passed else 'FAIL'}", green if passed else red))
 
     lines.append(("", white))  # spacer
     lines.append((timestamp_text, (180, 180, 180)))

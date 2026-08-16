@@ -5,6 +5,8 @@ from collections import deque
 from statistics import median
 from typing import Optional
 
+from app.scale_sample import ScaleSample, StabilityTracker, constant_sample
+
 logger = logging.getLogger(__name__)
 
 
@@ -18,19 +20,42 @@ class BaseScaleReader:
         Camera inference uses this to avoid blocking on serial retries."""
         return None
 
+    def get_latest_sample(self) -> ScaleSample:
+        """Cached weight *with* timestamp, freshness, and stability.
+
+        Preferred over get_latest_weight(): a bare float cannot tell a caller
+        whether the scale is still connected or whether the reading has
+        settled, and weight verification needs both.
+        """
+        return ScaleSample()
+
     def close(self) -> None:
         pass
 
 
 class MockScaleReader(BaseScaleReader):
-    def __init__(self, mock_weight: float):
+    """Fixed weight, reported as a genuinely fresh and stable sample.
+
+    A constant really is stable, which is what makes mock mode useful for
+    exercising the full PASS/FAIL path with no hardware attached.
+    """
+
+    def __init__(self, mock_weight: float, stable: bool = True):
         self.mock_weight = mock_weight
+        self.stable = stable
 
     def read_weight(self) -> Optional[float]:
         return self.mock_weight
 
     def get_latest_weight(self) -> Optional[float]:
         return self.mock_weight
+
+    def get_latest_sample(self) -> ScaleSample:
+        sample = constant_sample(self.mock_weight)
+        if not self.stable:
+            sample.stable = False
+            sample.reason = "unstable"
+        return sample
 
 
 class SerialScaleReader(BaseScaleReader):
@@ -75,6 +100,11 @@ class SerialScaleReader(BaseScaleReader):
         filter_window: int = 3,
         transition_threshold: float = 5.0,
         debug: bool = False,
+        stable_window_sec: float = 1.5,
+        stable_range_grams: float = 1.0,
+        stable_min_samples: int = 3,
+        max_sample_age_sec: float = 2.0,
+        stable_min_coverage_ratio: float = 0.5,
     ):
         self.port = port
         self.baudrate = baudrate
@@ -92,6 +122,18 @@ class SerialScaleReader(BaseScaleReader):
         self._zero_candidate_count: int = 0          # consecutive near-zero readings seen
         self._raw_window: deque = deque(maxlen=max(1, filter_window))  # for median
         self._scale_debug          = debug
+
+        # Timestamped history of accepted (filtered) values.  Drives freshness
+        # and stability; without it a cached value from before an unplug would
+        # keep looking like a live measurement forever.
+        self._tracker = StabilityTracker(
+            window_sec=stable_window_sec,
+            range_grams=stable_range_grams,
+            min_samples=stable_min_samples,
+            max_age_sec=max_sample_age_sec,
+            min_coverage_ratio=stable_min_coverage_ratio,
+        )
+        self._was_connected = False
 
     # ── connection management ─────────────────────────────────────────
 
@@ -113,7 +155,13 @@ class SerialScaleReader(BaseScaleReader):
             ser.dtr = False
             ser.open()
             self._ser = ser
-            logger.info("[ScaleReader] Connected to %s at %d baud.", self.port, self.baudrate)
+            if self._was_connected:
+                logger.info("[ScaleReader] Reconnected to %s at %d baud.",
+                            self.port, self.baudrate)
+            else:
+                logger.info("[ScaleReader] Connected to %s at %d baud.",
+                            self.port, self.baudrate)
+            self._was_connected = True
             return True
         except Exception as exc:
             logger.warning(
@@ -123,6 +171,23 @@ class SerialScaleReader(BaseScaleReader):
             )
             self._ser = None
             return False
+
+    def _drop_connection(self, why: str) -> None:
+        """Close and discard a broken handle so the next read reconnects.
+
+        Called inside self._lock.  The sample history is deliberately NOT
+        cleared here: the tracker's freshness rule ages the last reading out on
+        its own, which is what makes a disconnect visible as fresh=false rather
+        than as a sudden "no reading".
+        """
+        ser, self._ser = self._ser, None
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:  # noqa: BLE001 - the handle is already broken
+                pass
+        logger.warning("[ScaleReader] Connection dropped (%s) — will reconnect on next read.",
+                       why)
 
     # ── line parser ───────────────────────────────────────────────────
 
@@ -162,6 +227,15 @@ class SerialScaleReader(BaseScaleReader):
         Never touches the serial port.  Thread-safe."""
         with self._cache_lock:
             return self._latest
+
+    def get_latest_sample(self) -> ScaleSample:
+        """Non-blocking: last reading plus age, freshness, and stability.
+
+        Never touches the serial port.  Once the scale stops sending (cable
+        pulled, board reset) the reported age grows and fresh flips to False,
+        so a stale cached value can never be verified as if it were live.
+        """
+        return self._tracker.snapshot()
 
     def _apply_sample(self, raw_value: float) -> None:
         """Apply transition-aware zero-rejection debounce and median filter.
@@ -213,6 +287,7 @@ class SerialScaleReader(BaseScaleReader):
                     self._raw_window.append(0.0)
                     with self._cache_lock:
                         self._latest = 0.0
+                    self._tracker.add(0.0)
                     self._zero_candidate_count = 0
                     if self._scale_debug:
                         logger.debug(
@@ -258,6 +333,7 @@ class SerialScaleReader(BaseScaleReader):
         filtered = float(median(self._raw_window))
         with self._cache_lock:
             self._latest = filtered
+        self._tracker.add(filtered)
 
         if self._scale_debug:
             logger.debug(
@@ -284,10 +360,7 @@ class SerialScaleReader(BaseScaleReader):
                     try:
                         raw = self._ser.readline()
                     except Exception as exc:
-                        logger.warning(
-                            "[ScaleReader] Read error: %s — will reconnect on next call.", exc
-                        )
-                        self._ser = None
+                        self._drop_connection("read error: %s" % exc)
                         break
 
                     if not raw:
@@ -300,6 +373,7 @@ class SerialScaleReader(BaseScaleReader):
 
             except Exception as exc:
                 logger.warning("[ScaleReader] Unexpected error: %s", exc)
+                self._drop_connection("unexpected error: %s" % exc)
 
             return self._latest
 
@@ -311,6 +385,7 @@ class SerialScaleReader(BaseScaleReader):
                 except Exception:
                     pass
                 self._ser = None
+        self._tracker.reset()
 
 
 def create_scale_reader(
@@ -325,6 +400,11 @@ def create_scale_reader(
     filter_window: int = 3,
     transition_threshold: float = 5.0,
     debug: bool = False,
+    stable_window_sec: float = 1.5,
+    stable_range_grams: float = 1.0,
+    stable_min_samples: int = 3,
+    max_sample_age_sec: float = 2.0,
+    stable_min_coverage_ratio: float = 0.5,
 ) -> BaseScaleReader:
     if mode == "mock":
         return MockScaleReader(mock_weight=mock_weight)
@@ -339,5 +419,10 @@ def create_scale_reader(
             filter_window=filter_window,
             transition_threshold=transition_threshold,
             debug=debug,
+            stable_window_sec=stable_window_sec,
+            stable_range_grams=stable_range_grams,
+            stable_min_samples=stable_min_samples,
+            max_sample_age_sec=max_sample_age_sec,
+            stable_min_coverage_ratio=stable_min_coverage_ratio,
         )
     raise ValueError(f"Unsupported scale reader mode: '{mode}'. Choose 'mock' or 'serial'.")

@@ -23,6 +23,9 @@ output/uploads/
 output/annotated/
 output/frames/
 output/history.json
+# Per-package operator configuration — seeded from the package defaults on first
+# start, then edited on site.  Machine-specific, so not tracked.
+output/profiles/
 
 # Logs
 *.log

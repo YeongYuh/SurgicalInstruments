@@ -2,28 +2,32 @@ from __future__ import annotations
 
 import base64
 import copy
-import json
 import logging
-import os
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 # ── Background scale poll thread ──────────────────────────────────────────────
-# Drains the serial buffer at SCALE_BG_POLL_INTERVAL Hz during recognition so
-# that /api/weight can return get_latest_weight() (non-blocking) instead of
-# calling read_weight() (which can block up to SERIAL_TIMEOUT seconds).
+# Drains the serial buffer at SCALE_BG_POLL_INTERVAL Hz so that /api/weight can
+# return get_latest_sample() (non-blocking) instead of calling read_weight()
+# (which can block up to SERIAL_TIMEOUT seconds).
+#
+# It runs for the whole lifetime of the process in serial mode, not just during
+# recognition.  Freshness and stability are defined over a *time window*: a
+# single burst of reads taken at the moment of an upload all carry the same
+# timestamp and could never satisfy the window, so a reading could never settle.
+# Continuous sampling also keeps the serial buffer drained, so a read never
+# returns a value that has been sitting in the kernel buffer for seconds.
 _scale_bg_stop   = threading.Event()
 _scale_bg_thread: Optional[threading.Thread] = None
 _scale_bg_lock   = threading.Lock()
 
 
 def _scale_bg_poll_loop(stop: threading.Event) -> None:
-    """Continuously drain the serial scale buffer while recognition is active."""
+    """Continuously drain the serial scale buffer."""
     while not stop.is_set():
         try:
             web_pkg.scale_reader.read_weight()
@@ -36,6 +40,8 @@ def _scale_bg_poll_loop(stop: threading.Event) -> None:
 def _start_scale_bg_poll() -> None:
     """Start the background serial drain thread (idempotent)."""
     global _scale_bg_thread
+    if config.SCALE_READER_MODE != "serial":
+        return  # mock mode needs no sampling — a constant is always stable
     with _scale_bg_lock:
         if _scale_bg_thread is not None and _scale_bg_thread.is_alive():
             return
@@ -47,8 +53,8 @@ def _start_scale_bg_poll() -> None:
             daemon=True,
         )
         _scale_bg_thread.start()
-    logger.debug("[scale] bg poll started interval=%.0f ms",
-                 config.SCALE_BG_POLL_INTERVAL * 1000)
+    logger.info("[scale] bg poll started interval=%.0f ms",
+                config.SCALE_BG_POLL_INTERVAL * 1000)
 
 
 def _stop_scale_bg_poll() -> None:
@@ -68,60 +74,81 @@ from flask import Response, jsonify, render_template, request, stream_with_conte
 
 import app.config as config
 import app.web as web_pkg
+from app.inference import ModelManagerError, available_adapters
 from app.visualizer import draw_detections
 from app.web import history as hist
 from app.web import report as rpt
 from app.web.camera import CameraThread
-from app.web import compute_weight_verification
-
-_STANDARDS_FILE = Path(config.OUTPUT_DIR) / "standards.json"
-_UNIT_WEIGHTS_FILE = Path(config.OUTPUT_DIR) / "unit_weights.json"
+from app.weight_verification import compute_weight_verification
 
 
-# ── Persist helpers ──────────────────────────────────────────────────────────
+# ── Scale helpers ────────────────────────────────────────────────────────────
 
-def _save_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+def _current_sample():
+    """Latest scale sample, without blocking a web thread on serial I/O.
+
+    The background poll thread keeps the cache fresh.  If it is not running for
+    some reason (mock mode has no thread; a startup race), fall back to one
+    direct read so the endpoint still answers with real data.
+    """
+    sample = web_pkg.scale_reader.get_latest_sample()
+    if sample.value is None:
+        web_pkg.scale_reader.read_weight()
+        sample = web_pkg.scale_reader.get_latest_sample()
+    return sample
 
 
-# ── Auto-discovery: add new classes to both dicts ────────────────────────────
-
-def _register_new_classes(counts: dict) -> None:
-    changed_std = changed_uw = False
-    with web_pkg.state_lock:
-        for name in counts:
-            if name not in web_pkg.standards:
-                web_pkg.standards[name] = 0
-                changed_std = True
-            if name not in web_pkg.unit_weights:
-                web_pkg.unit_weights[name] = 0.0
-                changed_uw = True
-        if changed_std:
-            _save_json(_STANDARDS_FILE, web_pkg.standards)
-        if changed_uw:
-            _save_json(_UNIT_WEIGHTS_FILE, web_pkg.unit_weights)
+def _inference_overrides():
+    """Env overrides for confidence / image size, else the package's own values."""
+    conf = config.CONF_THRESHOLD if config.CONF_THRESHOLD_EXPLICIT else None
+    imgsz = None
+    return conf, imgsz
 
 
 # ── Core inference helper ────────────────────────────────────────────────────
 
 def _run_image_inference(image_bgr: np.ndarray, source_label: str) -> dict:
-    _, detections = web_pkg.detector.predict(image_bgr, conf=config.CONF_THRESHOLD)
-    counts = web_pkg.detector.count_instruments(detections)
-    weight = web_pkg.scale_reader.read_weight()
+    """Single-shot inference on one image, published to the shared state.
 
-    annotated = draw_detections(image_bgr, detections)
+    Runs entirely against ONE atomic snapshot of the active package.  If the
+    package is switched while inference is running the result is refused rather
+    than published, because counts from one instrument family judged against
+    another family's standards are meaningless.
+    """
+    manager = web_pkg.model_manager
+    model_state = manager.state()
+    if not model_state.ready:
+        return {
+            "ok": False,
+            "error": "尚未載入器械模型套件（%s）" % (manager.last_error or "未設定"),
+        }
+    model_generation = model_state.generation
+
+    conf, imgsz = _inference_overrides()
+    try:
+        result = manager.infer(image_bgr, conf=conf, imgsz=imgsz)
+    except ModelManagerError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    if manager.generation != model_generation:
+        return {
+            "ok": False,
+            "error": "辨識過程中器械模型套件已切換，請重新辨識",
+            "model_changed": True,
+        }
+
+    counts = result.counts
+    sample = _current_sample()
+    weight = sample.value
+
+    annotated = draw_detections(image_bgr, result.detections)
     _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
     b64 = base64.b64encode(buf).decode()
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    with web_pkg.state_lock:
-        std_snap = dict(web_pkg.standards)
-
-    wv = compute_weight_verification(std_snap, web_pkg.class_weights, weight, config.WEIGHT_TOLERANCE)
+    std_snap = model_state.standards
+    class_weights = model_state.class_weights
+    wv = compute_weight_verification(std_snap, class_weights, sample, config.WEIGHT_TOLERANCE)
 
     with web_pkg.state_lock:
         web_pkg.latest_state.update({
@@ -130,15 +157,23 @@ def _run_image_inference(image_bgr: np.ndarray, source_label: str) -> dict:
             "weight": weight,
             "annotated_b64": b64,
             "weight_verification": wv,
+            "package_id": model_state.package_id,
+            "package_display_name": model_state.display_name,
+            "model_generation": model_generation,
         })
 
-    _register_new_classes(counts)
+    web_pkg.register_classes(counts.keys())
 
     record = hist.make_record(
         source=source_label,
         counts=counts,
         weight=weight,
         standards_snapshot=std_snap,
+        package_id=model_state.package_id,
+        package_display_name=model_state.display_name,
+        model_identity=(result.model_info.identity() if result.model_info else None),
+        class_weights_snapshot=class_weights,
+        weight_verification=wv,
     )
     hist.append_record(record)
 
@@ -148,7 +183,11 @@ def _run_image_inference(image_bgr: np.ndarray, source_label: str) -> dict:
         "counts": counts,
         "annotated_image": b64,
         "weight": weight,
+        "weight_sample": sample.to_dict(),
         "weight_verification": wv,
+        "package_id": model_state.package_id,
+        "package_display_name": model_state.display_name,
+        "inference_ms": round(result.inference_ms, 1),
     }
 
 
@@ -250,7 +289,7 @@ def camera_frame():
 @app.route("/camera/stream")
 def camera_stream():
     req_session = request.args.get("session", type=int)
-    # overlay=1 reserved for future detection-box overlay without re-running YOLO
+    # overlay=1 reserved for future detection-box overlay without re-running inference
 
     with web_pkg.state_lock:
         cam        = web_pkg.camera_thread
@@ -320,10 +359,11 @@ def camera_result():
         return jsonify(ok=False, error="Camera not started")
     result = cam.get_result()
     result["ok"] = True
-    with web_pkg.state_lock:
-        std = dict(web_pkg.standards)
+    model_state = web_pkg.model_manager.state()
+    sample = _current_sample()
+    result["weight_sample"] = sample.to_dict()
     result["weight_verification"] = compute_weight_verification(
-        std, web_pkg.class_weights, result.get("weight"), config.WEIGHT_TOLERANCE
+        model_state.standards, model_state.class_weights, sample, config.WEIGHT_TOLERANCE
     )
     return jsonify(result)
 
@@ -386,10 +426,6 @@ def camera_start():
 
 @app.route("/camera/stop", methods=["POST"])
 def camera_stop():
-    # Stop the background scale poll thread first — it has no dependency on the
-    # camera and stopping it here covers the case where the user closes the camera
-    # while recognition (and therefore the bg thread) is still active.
-    _stop_scale_bg_poll()
     # Hold the lifecycle lock for the entire stop-and-join sequence so that a
     # concurrent /camera/start cannot open /dev/video0 before cap.release() has
     # been called.  state_lock is acquired briefly inside, then released; the
@@ -416,6 +452,7 @@ def camera_stop():
             cam.stop_recognition()
             # stop() sets _stopping=True + _stop_event → is_running()=False instantly,
             # blocking new inference and making all preview/status routes return "stopped".
+            # It also cancels any camera recovery backoff in progress.
             inf_running_at_stop = cam.get_status().get("inference_running", False)
             cam.stop()
             if config.CAMERA_DEBUG:
@@ -465,8 +502,10 @@ def camera_recognition_start():
         logger.debug("[/camera/recognition/start] cam=%s running=%s", cam, cam_running)
     if not cam_running:
         return jsonify(ok=False, error="Camera is not running"), 400
+    if not web_pkg.model_manager.state().ready:
+        return jsonify(ok=False, error="尚未載入器械模型套件"), 400
     cam.start_recognition()
-    _start_scale_bg_poll()   # keep weight cache fresh during recognition
+    _start_scale_bg_poll()   # idempotent — the thread normally runs already
     st = cam.get_status()
     if config.CAMERA_DEBUG:
         logger.debug("[/camera/recognition/start] started: gen=%s rec=%s",
@@ -478,7 +517,6 @@ def camera_recognition_start():
 
 @app.route("/camera/recognition/stop", methods=["POST"])
 def camera_recognition_stop():
-    _stop_scale_bg_poll()    # no longer need the cache refresh
     with web_pkg.state_lock:
         cam = web_pkg.camera_thread
     if cam is not None:
@@ -504,48 +542,43 @@ def camera_recognition_stop():
 
 @app.route("/api/weight")
 def api_weight():
-    """
-    Live scale weight endpoint — polled by the frontend during recognition.
+    """Live scale reading with freshness and stability metadata.
 
-    During recognition the background scale poll thread (started by
-    /camera/recognition/start) continuously drains the serial buffer at
-    SCALE_BG_POLL_INTERVAL Hz, keeping _latest fresh.  This endpoint calls
-    get_latest_weight() (non-blocking, no serial I/O) so it returns in <1 ms.
+    The background poll thread keeps the sample cache fresh, so this returns in
+    well under a millisecond without touching the serial port.
 
-    Falls back to read_weight() if no background thread is active (e.g. upload
-    mode or first call before recognition starts).
-
-    Returns:
-        {ok: true,  weight: 123.4, unit: "g", source: "serial", weight_verification: {...}}
-        {ok: false, weight: null,  unit: "g", source: "serial",
-         error: "No valid scale reading yet", weight_verification: {...}}
+    ``ready_for_verification`` is the gate: while it is false the frontend must
+    show a measuring state, NOT a red FAIL — an unsettled scale is an unfinished
+    measurement, not a failed inventory.
     """
     client = request.args.get("client", "")
     reason = request.args.get("reason", "")
     t0 = time.monotonic()
-    # Prefer non-blocking cached read; background thread keeps cache fresh.
-    weight = web_pkg.scale_reader.get_latest_weight()
-    source = "cache"
-    if weight is None:
-        weight = web_pkg.scale_reader.read_weight()
-        source = "read"
+    sample = _current_sample()
     ms = (time.monotonic() - t0) * 1000
-    logger.debug("[/api/weight] weight=%s source=%s(%s) client=%s reason=%s latency=%.1fms",
-                 weight, config.SCALE_READER_MODE, source, client, reason, ms)
+    logger.debug("[/api/weight] weight=%s stable=%s fresh=%s age=%s client=%s "
+                 "reason=%s latency=%.1fms",
+                 sample.value, sample.stable, sample.fresh, sample.age_sec,
+                 client, reason, ms)
 
-    with web_pkg.state_lock:
-        std = dict(web_pkg.standards)
-
-    wv = compute_weight_verification(std, web_pkg.class_weights, weight, config.WEIGHT_TOLERANCE)
+    model_state = web_pkg.model_manager.state()
+    wv = compute_weight_verification(
+        model_state.standards, model_state.class_weights, sample, config.WEIGHT_TOLERANCE
+    )
 
     resp = {
-        "ok":                  weight is not None,
-        "weight":              weight,
-        "unit":                "g",
-        "source":              config.SCALE_READER_MODE,
-        "weight_verification": wv,
+        "ok":                    sample.value is not None,
+        "weight":                sample.value,
+        "unit":                  "g",
+        "source":                config.SCALE_READER_MODE,
+        "stable":                sample.stable,
+        "fresh":                 sample.fresh,
+        "sample_age":            wv["sample_age"],
+        "sample":                sample.to_dict(),
+        "ready_for_verification": wv["ready"],
+        "weight_verification":   wv,
     }
-    if weight is None:
+    if sample.value is None:
         resp["error"] = "No valid scale reading yet"
     return jsonify(resp)
 
@@ -565,21 +598,116 @@ def status():
         rec_running  = cam_st["recognition_running"]
         inf_running  = cam_st["inference_running"]
         cam_stopping = cam_st.get("stopping", False)
+        cam_recovering = cam_st.get("recovering", False)
     else:
         rec_running  = False
         inf_running  = False
         cam_stopping = False
+        cam_recovering = False
+    model_state = web_pkg.model_manager.state()
     if config.CAMERA_DEBUG:
         logger.debug(
-            "[/status] cam=%s stopping=%s rec=%s inf=%s sid=%s client=%s",
-            cam_running, cam_stopping, rec_running, inf_running, active_sid, client,
+            "[/status] cam=%s stopping=%s rec=%s inf=%s sid=%s client=%s pkg=%s",
+            cam_running, cam_stopping, rec_running, inf_running, active_sid,
+            client, model_state.package_id,
         )
+    # Built explicitly rather than splatted: latest_state carries its own
+    # model_generation (the one that produced the counts on screen), which is a
+    # different thing from the currently active generation.
+    payload = dict(state)
+    payload.update({
+        "camera_active": cam_running,
+        "camera_stopping": cam_stopping,
+        "camera_recovering": cam_recovering,
+        "recognition_running": rec_running,
+        "session_id": active_sid,
+        "active_package": model_state.package_id or None,
+        "active_package_name": model_state.display_name or None,
+        # generation of the active package right now
+        "model_generation": model_state.generation,
+        # generation under which the displayed counts were produced
+        "result_model_generation": state.get("model_generation"),
+        "model_ready": model_state.ready,
+    })
+    return jsonify(payload)
+
+
+# ── Model package API ────────────────────────────────────────────────────────
+
+@app.route("/api/model-packages")
+def api_model_packages():
+    """All discovered packages, whether valid, and which one is active."""
+    manager = web_pkg.model_manager
     return jsonify(
-        camera_active=cam_running,
-        camera_stopping=cam_stopping,
-        recognition_running=rec_running,
-        session_id=active_sid,
-        **state,
+        ok=True,
+        active=manager.state().package_id or None,
+        packages=manager.list_packages(),
+        adapters=available_adapters(),
+    )
+
+
+@app.route("/api/model-package", methods=["GET"])
+def api_model_package_get():
+    """Identity and load state of the active package."""
+    return jsonify(ok=True, **web_pkg.model_manager.model_info())
+
+
+@app.route("/api/model-package", methods=["POST"])
+def api_model_package_post():
+    """Switch the active model package.
+
+    The response is only ``ok`` once the new model is actually loaded and
+    usable — activation is fully synchronous, so a success here means the next
+    inference will run on the new package.
+
+    Order matters: recognition is stopped first so no worker starts against the
+    old package mid-switch; ModelManager.activate() then loads everything before
+    swapping, so a failure leaves the previous package serving; finally the
+    stale runtime results are cleared, because counts from the old instrument
+    family mean nothing under the new one.
+    """
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not data.get("id"):
+        return jsonify(ok=False, error="Expected JSON object with an 'id' field"), 400
+    package_id = str(data["id"])
+
+    manager = web_pkg.model_manager
+    current = manager.state()
+    if current.ready and current.package_id == package_id:
+        return jsonify(ok=True, status="already_active", **manager.model_info())
+
+    with web_pkg.state_lock:
+        cam = web_pkg.camera_thread
+    was_recognizing = False
+    if cam is not None and cam.is_running():
+        was_recognizing = bool(cam.get_status().get("recognition_running"))
+        if was_recognizing:
+            logger.info("[model-switch] pausing recognition for switch to '%s'", package_id)
+            cam.stop_recognition()
+
+    try:
+        manager.activate(package_id)
+    except ModelManagerError as exc:
+        logger.error("[model-switch] failed: %s", exc)
+        return jsonify(
+            ok=False,
+            error=str(exc),
+            active=manager.state().package_id or None,
+            recognition_resumed=False,
+        ), 400
+
+    # Invalidate everything produced by the previous package.
+    web_pkg.reset_latest_state()
+    if cam is not None:
+        cam.invalidate_results()
+
+    logger.info("[model-switch] now active: '%s' (generation=%d)",
+                package_id, manager.generation)
+    return jsonify(
+        ok=True,
+        status="switched",
+        recognition_stopped=was_recognizing,
+        **manager.model_info(),
     )
 
 
@@ -591,9 +719,9 @@ def get_history():
 @app.route("/report")
 def get_report():
     records = hist.load_history()
-    with web_pkg.state_lock:
-        standards = dict(web_pkg.standards)
-    csv_str = rpt.generate_csv(records, standards)
+    # Only a fallback for pre-package records: every record written since
+    # carries the standards that were in force when it was taken.
+    csv_str = rpt.generate_csv(records, web_pkg.get_standards())
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     return Response(
         csv_str.encode("utf-8-sig"),
@@ -604,19 +732,21 @@ def get_report():
 
 @app.route("/bom_report")
 def bom_report():
+    model_state = web_pkg.model_manager.state()
     with web_pkg.state_lock:
-        standards = dict(web_pkg.standards)
-        unit_weights = dict(web_pkg.unit_weights)
         state = copy.deepcopy(web_pkg.latest_state)
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     csv_str = rpt.generate_bom_csv(
         counts=state.get("counts", {}),
-        standards=standards,
-        unit_weights=unit_weights,
+        standards=model_state.standards,
+        unit_weights=model_state.unit_weights,
         actual_weight=state.get("weight"),
         tolerance=config.WEIGHT_TOLERANCE,
         timestamp=ts,
+        package_id=model_state.package_id,
+        package_display_name=model_state.display_name,
+        weight_verification=state.get("weight_verification"),
     )
     file_ts = ts.replace(" ", "_").replace(":", "-")
     return Response(
@@ -628,8 +758,7 @@ def bom_report():
 
 @app.route("/standards", methods=["GET"])
 def get_standards():
-    with web_pkg.state_lock:
-        return jsonify(dict(web_pkg.standards))
+    return jsonify(web_pkg.get_standards())
 
 
 @app.route("/standards", methods=["POST"])
@@ -643,22 +772,22 @@ def post_standards():
             parsed[str(k)] = max(0, int(v))
         except (ValueError, TypeError):
             return jsonify(ok=False, error=f"Invalid value for '{k}': {v}"), 400
-    with web_pkg.state_lock:
-        web_pkg.standards.update(parsed)
-        _save_json(_STANDARDS_FILE, web_pkg.standards)
+    try:
+        web_pkg.update_standards(parsed)
+    except ModelManagerError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
     return jsonify(ok=True)
 
 
 @app.route("/class_weights")
 def get_class_weights():
-    """Return the class_weight.json data (read-only model-defined weights)."""
-    return jsonify(web_pkg.class_weights)
+    """Per-class unit weights defined by the ACTIVE package (read-only)."""
+    return jsonify(web_pkg.get_class_weights())
 
 
 @app.route("/unit_weights", methods=["GET"])
 def get_unit_weights():
-    with web_pkg.state_lock:
-        return jsonify(dict(web_pkg.unit_weights))
+    return jsonify(web_pkg.get_unit_weights())
 
 
 @app.route("/unit_weights", methods=["POST"])
@@ -672,9 +801,10 @@ def post_unit_weights():
             parsed[str(k)] = max(0.0, float(v))
         except (ValueError, TypeError):
             return jsonify(ok=False, error=f"Invalid value for '{k}': {v}"), 400
-    with web_pkg.state_lock:
-        web_pkg.unit_weights.update(parsed)
-        _save_json(_UNIT_WEIGHTS_FILE, web_pkg.unit_weights)
+    try:
+        web_pkg.update_unit_weights(parsed)
+    except ModelManagerError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
     return jsonify(ok=True)
 
 
@@ -704,7 +834,6 @@ def system_shutdown():
     # Fire-and-forget: give the HTTP response ~0.5 s to reach the browser, then
     # issue the shutdown command.  subprocess.Popen does not block Flask.
     import subprocess
-    import threading
 
     def _do_shutdown() -> None:
         import time as _time
@@ -718,3 +847,9 @@ def system_shutdown():
     threading.Thread(target=_do_shutdown, name="shutdown-trigger", daemon=True).start()
     logger.info("[shutdown] shutdown scheduled by web UI")
     return jsonify(ok=True, message="Shutdown scheduled")
+
+
+# Start sampling immediately so weight readings have a populated time window
+# before the operator's first action.
+if not config.DISABLE_BOOTSTRAP:
+    _start_scale_bg_poll()

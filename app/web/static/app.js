@@ -28,6 +28,8 @@ let cameraSessionId         = 0;      // matches backend camera_session_id
 let recognitionStopPending  = false;  // true while stop is in-flight / unconfirmed by backend
 let cameraStopPending       = false;  // true while camera stop is in-flight / unconfirmed
 let cameraStartPending      = false;  // true while /camera/start fetch is in-flight
+let activePackageId         = null;   // id of the active model package
+let availablePackages       = [];     // /api/model-packages payload
 
 // ── Init ──────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', async () => {
@@ -38,6 +40,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   appInitialized = true;
   console.debug('[init] app start CLIENT_ID=' + CLIENT_ID);
   initChart();
+  await loadPackages();
   await fetchStandards();
   await fetchUnitWeights();
   await fetchClassWeights();
@@ -155,6 +158,98 @@ async function fetchClassWeights() {
   } catch (e) { console.error('fetchClassWeights:', e); }
 }
 
+// ── Model packages ────────────────────────────────────────────────────────
+// The active package decides which instruments exist, what they weigh, and how
+// many are expected.  Switching it invalidates every cached result on screen.
+async function loadPackages() {
+  try {
+    const res  = await fetch('/api/model-packages');
+    const data = await res.json();
+    availablePackages = data.packages || [];
+    activePackageId   = data.active || null;
+    renderPackageSelect();
+  } catch (e) {
+    console.error('loadPackages:', e);
+  }
+}
+
+function renderPackageSelect() {
+  const sel = document.getElementById('package-select');
+  if (!sel) return;
+  if (!availablePackages.length) {
+    sel.innerHTML = '<option value="">（無可用套件）</option>';
+    return;
+  }
+  sel.innerHTML = availablePackages.map(p => {
+    // A template or a broken manifest is listed but cannot be selected — the
+    // operator should see it exists and needs configuring, not silently miss it.
+    const disabled = p.activatable ? '' : ' disabled';
+    let suffix = '';
+    if (p.template)   suffix = '（範本，未設定）';
+    else if (!p.valid) suffix = '（設定錯誤）';
+    const selected = p.id === activePackageId ? ' selected' : '';
+    return `<option value="${p.id}"${disabled}${selected}>${p.display_name}${suffix}</option>`;
+  }).join('');
+}
+
+function setPackageStatus(text, cls) {
+  const el = document.getElementById('package-status');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className   = cls || '';
+}
+
+async function onPackageChange(evt) {
+  const sel = evt.target;
+  const targetId = sel.value;
+  if (!targetId || targetId === activePackageId) return;
+
+  const previous = activePackageId;
+  sel.disabled = true;
+  setPackageStatus('切換中…', 'busy');
+  try {
+    const res  = await fetch('/api/model-package', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: targetId }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      // The switch already completed on the server, so everything derived from
+      // the old package must be dropped before the next poll paints it again.
+      await applyPackageSwitch(targetId);
+      setPackageStatus('已切換', 'ok');
+      setTimeout(() => setPackageStatus('', ''), 3000);
+    } else {
+      alert('切換器械套件失敗：' + (data.error || '未知錯誤'));
+      sel.value = previous || '';
+      setPackageStatus('切換失敗', 'error');
+    }
+  } catch (e) {
+    alert('連線錯誤：' + e.message);
+    sel.value = previous || '';
+    setPackageStatus('連線錯誤', 'error');
+  } finally {
+    sel.disabled = false;
+  }
+}
+
+async function applyPackageSwitch(newId) {
+  activePackageId = newId;
+  stopWeightPolling('package-switched');
+  recognitionActive      = false;
+  recognitionStopPending = false;
+  lastCounts = {};
+  rerenderTable({});
+  setUpdateTime('');
+  resetWeightDisplay();
+  await fetchStandards();
+  await fetchUnitWeights();
+  await fetchClassWeights();
+  await loadPackages();
+  syncCameraUI();
+}
+
 function scheduleUnitWeightsSync() {
   clearTimeout(uwDebounce);
   uwDebounce = setTimeout(pushUnitWeights, 300);
@@ -177,6 +272,24 @@ async function pushUnitWeights() {
 }
 
 // ── Weight verification display ───────────────────────────────────────────
+// Five distinct states.  A reading that has not settled is NOT rendered as a
+// red 不符合: an unstable scale is an unfinished measurement, not a failed
+// inventory, and painting it red teaches operators to ignore red.
+const WEIGHT_STATE_LABEL = {
+  waiting_weight:     '等待重量',
+  stabilizing:        '量測中',
+  no_standard_weight: '不明',
+  passed:             '符合',
+  failed:             '不符合',
+};
+
+function weightStateClass(state) {
+  if (state === 'passed')      return 'stat-box weight-ok-box passed';
+  if (state === 'failed')      return 'stat-box weight-ok-box failed';
+  if (state === 'stabilizing') return 'stat-box weight-ok-box measuring';
+  return 'stat-box weight-ok-box waiting';
+}
+
 function renderWeightVerification(wv) {
   if (!wv) return;
 
@@ -186,32 +299,45 @@ function renderWeightVerification(wv) {
   const wokEl    = document.getElementById('stat-wt-ok');
   const wokBox   = document.getElementById('stat-wt-ok-box');
   if (expWtEl) expWtEl.textContent = wv.expected != null ? `${wv.expected.toFixed(1)} g` : '—';
-  if (actWtEl) actWtEl.textContent = wv.actual   != null ? `${wv.actual.toFixed(1)} g`   : '—';
-  if (wokEl && wokBox) {
-    // Use backend-computed expected weight to determine if BOM is configured.
-    // expected = Σ(standard_count × unit_weight_per_class).
-    // If expected == 0 the BOM has no meaningful data (no unit weights set).
-    // Explicit null check avoids JS truthiness traps (0.0 is falsy).
-    const bomConfigured = wv.expected != null && wv.expected > 0;
-    console.debug(
-      '[wv] actual=' + wv.actual + ' expected=' + wv.expected
-      + ' tolerance=' + wv.tolerance + ' passed=' + wv.passed
-      + ' bomConfigured=' + bomConfigured,
-    );
+  if (actWtEl) {
     if (wv.actual == null) {
-      wokEl.textContent = '—';
-      wokBox.className  = 'stat-box weight-ok-box';
-    } else if (!bomConfigured) {
-      wokEl.textContent = '不明';
-      wokBox.className  = 'stat-box weight-ok-box';
-    } else if (wv.passed) {
-      wokEl.textContent = '符合';
-      wokBox.className  = 'stat-box weight-ok-box passed';
+      actWtEl.textContent = '未量測';
+    } else if (wv.fresh === false) {
+      // Show the last number but mark it as no longer live, so a cached value
+      // from before the cable was pulled cannot pass for a current reading.
+      actWtEl.textContent = `${wv.actual.toFixed(1)} g (逾時)`;
     } else {
-      wokEl.textContent = '不符合';
-      wokBox.className  = 'stat-box weight-ok-box failed';
+      actWtEl.textContent = `${wv.actual.toFixed(1)} g`;
     }
   }
+  if (wokEl && wokBox) {
+    const state = wv.state || 'waiting_weight';
+    console.debug(
+      '[wv] state=' + state + ' actual=' + wv.actual + ' expected=' + wv.expected
+      + ' tolerance=' + wv.tolerance + ' passed=' + wv.passed
+      + ' stable=' + wv.stable + ' fresh=' + wv.fresh,
+    );
+    wokEl.textContent = WEIGHT_STATE_LABEL[state] || '—';
+    wokBox.className  = weightStateClass(state);
+    wokBox.title      = wv.message || '';
+  }
+}
+
+// Copy only the fields the backend owns (scale reading + gate) into the cached
+// verification.  ``expected`` is deliberately NOT copied — it is recomputed
+// locally so the 2-second poll never overwrites a manual standards edit.
+function mergeBackendWV(src) {
+  if (!src) return;
+  if (_lastKnownWV == null) {
+    _lastKnownWV = { ...src };
+    return;
+  }
+  _lastKnownWV.actual        = src.actual;
+  _lastKnownWV.tolerance     = src.tolerance;
+  _lastKnownWV.stable        = src.stable;
+  _lastKnownWV.fresh         = src.fresh;
+  _lastKnownWV.sample_age    = src.sample_age;
+  _lastKnownWV.sample_reason = src.sample_reason;
 }
 
 // Delegates to recalculateExpectedAndRender — kept so pushStandards / pushUnitWeights
@@ -246,18 +372,39 @@ function recalculateExpectedAndRender(source) {
 
   const actual    = _lastKnownWV.actual;
   const tolerance = _lastKnownWV.tolerance;
-  const diff      = (actual != null && tolerance != null) ? Math.abs(actual - expected) : null;
-  const passed    = diff != null ? diff <= tolerance : false;
+  // Mirror the backend's stability gate exactly, but against the locally
+  // recomputed expected weight.  Undefined stable/fresh (older payloads) are
+  // treated as usable so nothing regresses to a permanent "measuring" state.
+  const fresh  = _lastKnownWV.fresh  !== false;
+  const stable = _lastKnownWV.stable !== false;
+
+  let state, diff = null, passed = null, ready = false;
+  if (actual == null || !fresh) {
+    state = 'waiting_weight';
+  } else if (!stable) {
+    state = 'stabilizing';
+  } else if (!(expected > 0)) {
+    state = 'no_standard_weight';
+  } else if (tolerance == null) {
+    state = 'waiting_weight';
+  } else {
+    diff   = Math.abs(actual - expected);
+    passed = diff <= tolerance;
+    ready  = true;
+    state  = passed ? 'passed' : 'failed';
+  }
 
   // Patch _lastKnownWV so any subsequent call sees the fresh expected value.
   _lastKnownWV.expected   = expected;
   _lastKnownWV.difference = diff;
   _lastKnownWV.passed     = passed;
+  _lastKnownWV.ready      = ready;
+  _lastKnownWV.state      = state;
 
   console.debug('[wv] recalc source=' + source
     + ' expected=' + expected.toFixed(1)
     + ' actual=' + actual
-    + ' passed=' + passed
+    + ' state=' + state
     + (debugParts.length
         ? '  classes=[' + debugParts.slice(0, 6).join(', ')
           + (debugParts.length > 6 ? '…' : '') + ']'
@@ -419,6 +566,20 @@ async function pollStatus() {
     const res  = await fetch('/status?client=' + CLIENT_ID);
     const data = await res.json();
 
+    // The package can change from another tab or a server restart.  Everything
+    // on screen belongs to the old package at that point, so resync before
+    // rendering anything else.
+    if (data.active_package && data.active_package !== activePackageId) {
+      if (activePackageId === null) {
+        activePackageId = data.active_package;
+        renderPackageSelect();
+      } else {
+        console.debug('[poll] package switched', activePackageId, '→', data.active_package);
+        await applyPackageSwitch(data.active_package);
+        return;
+      }
+    }
+
     const newCamActive = data.camera_active === true;
     const newRecActive = data.recognition_running === true;
     // session_id is the authoritative backend value; cameraSessionId must match it.
@@ -511,12 +672,7 @@ async function pollStatus() {
     // Expected is always recomputed from current frontend standards × classWeights so
     // that manual standard edits are never overwritten by the 2-second poll cycle.
     if (shouldRenderCounts && data.weight_verification) {
-      if (_lastKnownWV == null) {
-        _lastKnownWV = { ...data.weight_verification };
-      } else {
-        _lastKnownWV.actual    = data.weight_verification.actual;
-        _lastKnownWV.tolerance = data.weight_verification.tolerance;
-      }
+      mergeBackendWV(data.weight_verification);
       recalculateExpectedAndRender('pollStatus');
     }
 
@@ -591,8 +747,8 @@ function resetWeightDisplay() {
   const wokBox  = document.getElementById('stat-wt-ok-box');
   if (actWtEl) actWtEl.textContent = '未量測';
   if (wokEl && wokBox) {
-    wokEl.textContent = '不明';
-    wokBox.className  = 'stat-box weight-ok-box';
+    wokEl.textContent = WEIGHT_STATE_LABEL.waiting_weight;
+    wokBox.className  = weightStateClass('waiting_weight');
   }
   _lastKnownWV = null;
 }
@@ -670,13 +826,8 @@ async function pollWeight({ final: isFinal = false, token = undefined, reason = 
       return;
     }
     if (data.weight_verification) {
-      // Update actual weight from scale (fresh read); recompute expected locally.
-      if (_lastKnownWV == null) {
-        _lastKnownWV = { ...data.weight_verification };
-      } else {
-        _lastKnownWV.actual    = data.weight_verification.actual;
-        _lastKnownWV.tolerance = data.weight_verification.tolerance;
-      }
+      // Update actual weight + stability from the scale; recompute expected locally.
+      mergeBackendWV(data.weight_verification);
       recalculateExpectedAndRender('pollWeight');
     }
   } catch (e) {
@@ -806,14 +957,9 @@ async function startRecognize() {
         setUpdateTime(data.timestamp);
         showAnnotatedImage(data.annotated_image);
         if (data.weight_verification) {
-          // Seed _lastKnownWV with actual weight and tolerance from backend;
-          // recompute expected from current standards × classWeights.
-          if (_lastKnownWV == null) {
-            _lastKnownWV = { ...data.weight_verification };
-          } else {
-            _lastKnownWV.actual    = data.weight_verification.actual;
-            _lastKnownWV.tolerance = data.weight_verification.tolerance;
-          }
+          // Seed from the backend's scale reading; recompute expected from the
+          // current standards × classWeights.
+          mergeBackendWV(data.weight_verification);
           recalculateExpectedAndRender('upload');
         }
       } else {

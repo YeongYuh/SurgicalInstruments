@@ -27,9 +27,13 @@ export SCALE_READER_MODE="${SCALE_READER_MODE:-serial}"
 export SERIAL_PORT="${SERIAL_PORT:-/dev/ttyUSB0}"
 export SERIAL_BAUDRATE="${SERIAL_BAUDRATE:-9600}"
 
-# ── Detector backend (onnx=ONNX Runtime ~4x faster on CPU, pt=PyTorch fallback) ─
-export DETECTOR_BACKEND="${DETECTOR_BACKEND:-onnx}"
-export ONNX_MODEL_PATH="${ONNX_MODEL_PATH:-models/best.onnx}"
+# ── Active model package ──────────────────────────────────────────────────────
+# Which surgical instrument family to load.  The package manifest under
+# model_packages/<id>/manifest.json is the source of truth for the adapter, the
+# model file, the per-class weights, and the default standards.
+#   ACTIVE_MODEL_PACKAGE=demo ./run_jetson.sh
+export ACTIVE_MODEL_PACKAGE="${ACTIVE_MODEL_PACKAGE:-ortho_tka}"
+export MODEL_PACKAGES_DIR="${MODEL_PACKAGES_DIR:-$(pwd)/model_packages}"
 
 # ── Camera source (integer index or /dev/videoN path) ────────────────────────
 # Default to path-based open — more reliable than integer index on Jetson OpenCV.
@@ -55,6 +59,7 @@ export WEBCAM_DETECTION_INTERVAL="${WEBCAM_DETECTION_INTERVAL:-5}"
 export ENABLE_SYSTEM_SHUTDOWN="${ENABLE_SYSTEM_SHUTDOWN:-false}"
 
 # ── Startup diagnostics ──────────────────────────────────────────────────
+export PYTHONPATH="$(pwd)"
 python3 - <<'PYEOF'
 import sys, platform, os
 
@@ -89,10 +94,44 @@ except ImportError:
 import flask
 print(f"  Flask      : {flask.__version__}")
 
-model = os.environ.get("MODEL_PATH", "models/best.pt")
-print(f"  Model      : {model}  ({'OK' if os.path.exists(model) else 'MISSING'})")
-if not os.path.exists(model):
-    print("               -> place trained best.pt at the path above")
+# ── Active model package ─────────────────────────────────────────────────
+# Delegates to the application's own manifest loader — the shell must never
+# grow a second, divergent parser.
+active_pkg = os.environ.get("ACTIVE_MODEL_PACKAGE", "ortho_tka")
+try:
+    from pathlib import Path
+    import app.config as _cfg
+    from app.inference import discover_packages
+
+    found = discover_packages(Path(_cfg.MODEL_PACKAGES_DIR), project_root=_cfg.PROJECT_ROOT)
+    print(f"  Packages   : {', '.join(sorted(found)) or '(none found)'}")
+    entry = found.get(active_pkg)
+    if entry is None:
+        print(f"  [ERROR]    Active package '{active_pkg}' not found in {_cfg.MODEL_PACKAGES_DIR}")
+        print(f"             -> set ACTIVE_MODEL_PACKAGE to one of the packages above")
+    elif entry.package is None:
+        print(f"  [ERROR]    Active package '{active_pkg}' is invalid:")
+        print(f"             {entry.error}")
+    else:
+        pkg = entry.package
+        print(f"  Package    : {pkg.id}")
+        print(f"  Name       : {pkg.display_name}  ({pkg.department or 'n/a'})")
+        print(f"  Adapter    : {pkg.adapter}")
+        if pkg.is_template:
+            print(f"  [WARNING]  '{pkg.id}' is a TEMPLATE — fill in its manifest before use")
+        model_file = str(pkg.model_file) if pkg.model_file else "(none)"
+        print(f"  Model      : {model_file}  ({'OK' if pkg.model_file_exists() else 'MISSING'})")
+        if not pkg.model_file_exists():
+            if pkg.fallback_exists():
+                print(f"               -> falling back to {pkg.fallback_model_file}")
+            else:
+                fb = pkg.fallback_model_file or "(none declared)"
+                print(f"               -> fallback also missing: {fb}")
+                print(f"               -> export best.onnx: python3 -c \"from ultralytics import "
+                      f"YOLO; YOLO('models/best.pt').export(format='onnx', opset=12)\"")
+        print(f"  Weights    : {pkg.class_weights_path}")
+except Exception as exc:
+    print(f"  [ERROR]    Cannot read model packages: {exc}")
 
 import glob
 cam_src      = os.environ.get("CAMERA_SOURCE", os.environ.get("WEBCAM_INDEX", "0"))
@@ -120,19 +159,12 @@ elif not cam_src.startswith("/"):
         print(f"               -> available: {devs_str}")
         print(f"               -> try: CAMERA_SOURCE=/dev/video1 ./run_jetson.sh")
 
-backend = os.environ.get("DETECTOR_BACKEND", "pt")
-onnx_path = os.environ.get("ONNX_MODEL_PATH", "models/best.onnx")
-print(f"  Detector   : backend={backend}")
-if backend == "onnx":
-    onnx_ok = os.path.exists(onnx_path)
-    onnx_status = "OK" if onnx_ok else "MISSING — run: python3 -c \"from ultralytics import YOLO; YOLO('models/best.pt').export(format='onnx', opset=12)\""
-    print(f"  ONNX model : {onnx_path}  ({onnx_status})")
-    try:
-        import onnxruntime as ort
-        providers_str = ", ".join(ort.get_available_providers())
-        print(f"  onnxruntime: {ort.__version__}  providers=[{providers_str}]")
-    except ImportError:
-        print("  onnxruntime: NOT installed  -> pip install 'onnxruntime>=1.16,<1.20'")
+try:
+    import onnxruntime as ort
+    providers_str = ", ".join(ort.get_available_providers())
+    print(f"  onnxruntime: {ort.__version__}  providers=[{providers_str}]")
+except ImportError:
+    print("  onnxruntime: NOT installed  -> pip install 'onnxruntime>=1.16,<1.20'")
 
 mode = os.environ.get("SCALE_READER_MODE", "serial")
 port = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")
@@ -167,8 +199,8 @@ LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 PORT="${BACKEND_PORT:-5000}"
 
 echo ""
+echo "Package  : ${ACTIVE_MODEL_PACKAGE}  (dir=${MODEL_PACKAGES_DIR})"
 echo "Scale    : ${SCALE_READER_MODE}  port=${SERIAL_PORT}  baud=${SERIAL_BAUDRATE}"
-echo "Detector : ${DETECTOR_BACKEND}  onnx=${ONNX_MODEL_PATH}"
 echo "Camera   : source=${CAMERA_SOURCE}  detect_interval=${WEBCAM_DETECTION_INTERVAL}s"
 echo ""
 echo "Web UI:"

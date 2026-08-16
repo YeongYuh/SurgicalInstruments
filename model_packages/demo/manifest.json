@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+
+  "template": true,
+
+  "id": "demo",
+  "display_name": "Demo 器械組（尚未設定）",
+  "department": "demo",
+
+  "adapter": "ultralytics",
+
+  "model_file": "models/demo/model.onnx",
+  "fallback_model_file": "models/demo/model.pt",
+
+  "adapter_options": {
+    "task": "segment",
+    "strict": false,
+    "include_masks": false
+  },
+
+  "inference": {
+    "confidence": 0.25,
+    "image_size": 640
+  },
+
+  "inventory": {
+    "class_weights": "model_packages/demo/class_weight.json",
+    "default_standards": "model_packages/demo/standards.json"
+  }
+}

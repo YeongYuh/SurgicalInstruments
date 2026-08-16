@@ -11,7 +11,7 @@ from typing import Optional, Union
 import cv2
 
 import app.config as config
-from app.web import compute_weight_verification, history as hist
+from app.web import history as hist
 
 
 def _available_video_devices() -> list[str]:
@@ -42,6 +42,10 @@ def _open_capture(source: Union[int, str]) -> cv2.VideoCapture:
 _debug = config.CAMERA_DEBUG
 
 
+def _next_backoff(current: float) -> float:
+    return min(max(current, 0.1) * 2.0, config.CAMERA_REOPEN_MAX_BACKOFF_SEC)
+
+
 class CameraThread(threading.Thread):
     def __init__(self, camera_source: Union[int, str] = config.CAMERA_SOURCE,
                  session_id: int = 0):
@@ -67,6 +71,14 @@ class CameraThread(threading.Thread):
         self._last_inference_end: float = 0.0  # time.monotonic() when last inference finished
         self._frame_seq: int = 0
         self._error: Optional[str] = None
+        self._package_id: Optional[str] = None
+        self._package_display_name: Optional[str] = None
+        self._model_generation: int = 0
+
+        # Runtime read-failure recovery bookkeeping
+        self._consecutive_read_failures: int = 0
+        self._reopen_count: int = 0
+        self._recovering: bool = False
 
     # ── public read API (called from Flask routes) ────────────────────────
 
@@ -103,6 +115,11 @@ class CameraThread(threading.Thread):
                 "inference_running": self._inference_running,
                 "recognition_running": self._recognition_running,
                 "recognition_generation": self._recognition_generation,
+                "model_generation": self._model_generation,
+                "package_id": self._package_id,
+                "read_failures": self._consecutive_read_failures,
+                "reopen_count": self._reopen_count,
+                "recovering": self._recovering,
                 "error": self._error,
             }
 
@@ -112,6 +129,8 @@ class CameraThread(threading.Thread):
                 "timestamp": self._timestamp,
                 "counts": copy.deepcopy(self._counts),
                 "weight": self._weight,
+                "package_id": self._package_id,
+                "package_display_name": self._package_display_name,
                 "annotated_b64": (
                     base64.b64encode(self._latest_annotated).decode()
                     if self._latest_annotated
@@ -149,6 +168,22 @@ class CameraThread(threading.Thread):
         if _debug:
             print(f"[CameraThread] session={self.session_id} recognition STOP gen={gen}")
 
+    def invalidate_results(self) -> None:
+        """Drop published results and invalidate in-flight inference workers.
+
+        Called when the active model package changes: counts produced by the
+        previous model describe a different instrument set entirely.
+        """
+        with self._lock:
+            self._recognition_generation += 1
+            self._counts = {}
+            self._weight = None
+            self._timestamp = ""
+            self._last_detection_ts = ""
+            self._latest_annotated = b""
+            self._package_id = None
+            self._package_display_name = None
+
     def is_running(self) -> bool:
         return self.is_alive() and not self._stopping and not self._stop_event.is_set()
 
@@ -158,25 +193,14 @@ class CameraThread(threading.Thread):
         False on timeout (camera hung without producing a frame)."""
         return self._ready_event.wait(timeout=timeout)
 
-    # ── thread body ───────────────────────────────────────────────────────
+    # ── capture device setup ──────────────────────────────────────────────
 
-    def run(self) -> None:
-        # Import here to avoid circular import at module load time
-        from app.web import detector, scale_reader, standards, unit_weights, state_lock
-
+    def _open_configured(self) -> Optional[cv2.VideoCapture]:
+        """Open /dev/videoN and apply FOURCC / resolution / FPS.  None on failure."""
         cap = _open_capture(self.camera_source)
         if not cap.isOpened():
-            available = _available_video_devices()
-            msg = (
-                f"Cannot open camera source={self.camera_source!r} — "
-                f"available: {available or ['none found']}. "
-                f"Try: CAMERA_SOURCE=/dev/video0 ./run_jetson.sh"
-            )
-            print(f"[CameraThread] {msg}")
-            with self._lock:
-                self._error = msg
-            self._ready_event.set()  # unblock camera_start immediately
-            return
+            cap.release()
+            return None
 
         # Set FOURCC before resolution: some V4L2 drivers (Jetson 4.9 kernel) reset
         # the pixel format when width/height is applied, so FOURCC must come first.
@@ -190,7 +214,10 @@ class CameraThread(threading.Thread):
         # Note: CAP_PROP_BUFFERSIZE intentionally NOT set — forcing it to 1 triggers
         # VIDIOC_QBUF errors during cap.release() on the Jetson 4.9 kernel.
         # The driver default buffer count handles teardown correctly.
+        return cap
 
+    def _log_capture_settings(self, cap: cv2.VideoCapture) -> None:
+        _fourcc = config.CAMERA_FOURCC
         actual_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         actual_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -208,11 +235,13 @@ class CameraThread(threading.Thread):
             f"  actual    : {actual_w}x{actual_h}"
             f" @ {actual_fps:.0f} fps  fourcc={cc_actual!r}"
         )
-        if _debug:
-            print(f"[CameraThread] DEBUG session={self.session_id} capture loop entering")
 
-        # Discard initial black frames — USB cameras often send black frames on startup.
-        # Deadline prevents an infinite loop if the device opens but never delivers frames.
+    def _discard_warmup_frames(self, cap: cv2.VideoCapture) -> None:
+        """Discard initial black frames — USB cameras often send them on startup.
+
+        The deadline prevents an infinite loop if the device opens but never
+        delivers frames.
+        """
         warmup = 0
         warmup_deadline = time.monotonic() + 4.0  # 4 s absolute limit
         while warmup < 30 and time.monotonic() < warmup_deadline and not self._stop_event.is_set():
@@ -226,20 +255,108 @@ class CameraThread(threading.Thread):
         if warmup:
             print(f"[CameraThread] Warmup: {warmup} frame(s) discarded")
 
+    def _recover_capture(self, cap: Optional[cv2.VideoCapture]) -> Optional[cv2.VideoCapture]:
+        """Release a dead capture and reopen it with bounded backoff.
+
+        A USB camera can keep its device node open while silently delivering
+        nothing — the thread stays alive but no frame ever arrives again.  This
+        releases the handle and retries until it works or stop() is called.
+
+        Returns the new capture, or None if stop() was requested.  Never resets
+        the USB bus, never calls sudo, never reboots.
+        """
+        with self._lock:
+            self._recovering = True
+            self._reopen_count += 1
+            attempt = self._reopen_count
+        msg = (f"no frames after {config.CAMERA_READ_FAIL_THRESHOLD} consecutive read "
+               f"failures — reopening {self.camera_source!r} (attempt {attempt})")
+        print(f"[CameraThread] session={self.session_id} RECOVERY: {msg}")
+        with self._lock:
+            self._error = f"camera recovery in progress: {msg}"
+
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception as exc:  # noqa: BLE001 - the handle is already broken
+                print(f"[CameraThread] recovery: release error ignored: {exc}")
+
+        delay = config.CAMERA_REOPEN_BACKOFF_SEC
+        while not self._stop_event.is_set():
+            # Interruptible sleep — stop() cancels recovery immediately.
+            if self._stop_event.wait(timeout=delay):
+                return None
+            new_cap = self._open_configured()
+            if new_cap is not None:
+                self._discard_warmup_frames(new_cap)
+                with self._lock:
+                    self._recovering = False
+                    self._consecutive_read_failures = 0
+                    self._error = None
+                print(f"[CameraThread] session={self.session_id} RECOVERY: camera reopened "
+                      f"after {attempt} attempt(s)")
+                return new_cap
+            delay = _next_backoff(delay)
+            print(f"[CameraThread] session={self.session_id} RECOVERY: reopen failed — "
+                  f"retrying in {delay:.1f}s  (available: "
+                  f"{_available_video_devices() or ['none found']})")
+            with self._lock:
+                self._error = (f"camera unavailable — retrying every {delay:.0f}s "
+                               f"(source={self.camera_source!r})")
+        return None
+
+    # ── thread body ───────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        cap = self._open_configured()
+        if cap is None:
+            available = _available_video_devices()
+            msg = (
+                f"Cannot open camera source={self.camera_source!r} — "
+                f"available: {available or ['none found']}. "
+                f"Try: CAMERA_SOURCE=/dev/video0 ./run_jetson.sh"
+            )
+            print(f"[CameraThread] {msg}")
+            with self._lock:
+                self._error = msg
+            self._ready_event.set()  # unblock camera_start immediately
+            return
+
+        self._log_capture_settings(cap)
+        if _debug:
+            print(f"[CameraThread] DEBUG session={self.session_id} capture loop entering")
+        self._discard_warmup_frames(cap)
+
         read_ok = 0
-        read_fail = 0
+        read_fail_total = 0
+        consecutive_fail = 0
         _ready_signaled = False
 
         try:
             while not self._stop_event.is_set():
                 ret, frame = cap.read()
                 if not ret:
-                    read_fail += 1
-                    if read_fail % 30 == 1:
-                        print(f"[CameraThread] cap.read() failures: {read_fail} "
-                              f"(ok={read_ok})")
-                    time.sleep(0.05)
+                    read_fail_total += 1
+                    consecutive_fail += 1
+                    with self._lock:
+                        self._consecutive_read_failures = consecutive_fail
+                    if consecutive_fail % 30 == 1:
+                        print(f"[CameraThread] cap.read() failures: {read_fail_total} "
+                              f"(consecutive={consecutive_fail} ok={read_ok})")
+                    if consecutive_fail >= config.CAMERA_READ_FAIL_THRESHOLD:
+                        cap = self._recover_capture(cap)
+                        if cap is None:
+                            break  # stop() requested during recovery
+                        consecutive_fail = 0
+                        continue
+                    if self._stop_event.wait(timeout=0.05):
+                        break
                     continue
+
+                if consecutive_fail:
+                    consecutive_fail = 0
+                    with self._lock:
+                        self._consecutive_read_failures = 0
                 read_ok += 1
 
                 # Encode preview JPEG — only overwrite buffer when encode succeeds
@@ -283,8 +400,7 @@ class CameraThread(threading.Thread):
                               f"inference START gen={gen} seq={self._frame_seq}")
                     t = threading.Thread(
                         target=self._run_inference_bg,
-                        args=(frame.copy(), gen, detector, scale_reader,
-                              standards, unit_weights, state_lock),
+                        args=(frame.copy(), gen),
                         daemon=True,
                     )
                     t.start()
@@ -298,16 +414,15 @@ class CameraThread(threading.Thread):
             # noise during buffer teardown.  The camera restarts correctly on the
             # next session.  Do NOT call cap.grab() before release — that makes
             # the error worse by queuing into a half-closed device.
-            cap.release()
+            if cap is not None:
+                cap.release()
             if _debug:
                 print(f"[CameraThread] DEBUG session={self.session_id} released")
             print(f"[CameraThread] session={self.session_id} stopped.")
 
-    def _run_inference_bg(self, frame, generation, detector, scale_reader,
-                          standards, unit_weights, state_lock) -> None:
+    def _run_inference_bg(self, frame, generation) -> None:
         try:
-            self._run_inference(frame, generation, detector, scale_reader,
-                                standards, unit_weights, state_lock)
+            self._run_inference(frame, generation)
         finally:
             # Stamp end-time BEFORE clearing the flag so the capture loop
             # uses the correct cooldown baseline on the very next frame tick.
@@ -316,51 +431,56 @@ class CameraThread(threading.Thread):
                 self._inference_running = False
                 self._last_inference_end = t_end
 
-    def _run_inference(self, frame, generation, detector, scale_reader,
-                       standards, unit_weights, state_lock) -> None:
+    def _run_inference(self, frame, generation) -> None:
+        # Imported here (not at module top) to avoid a circular import at load time.
+        import app.web as web_pkg
+        from app.weight_verification import compute_weight_verification
+
         t_worker_start = time.perf_counter()
         try:
-            backend = getattr(detector, "_effective_backend", "unknown")
+            manager = web_pkg.model_manager
+            # One atomic snapshot: package, profile, adapter, and generation all
+            # belong to the same activation.  Reading them separately would allow
+            # a switch in between and pair one model's counts with another
+            # package's standards.
+            model_state = manager.state()
+            if not model_state.ready:
+                print(f"[CameraThread] session={self.session_id} "
+                      f"inference skipped — no active model package")
+                return
+            model_generation = model_state.generation
+
             h, w = frame.shape[:2]
+            imgsz = (config.CAMERA_INFERENCE_IMGSZ
+                     if config.CAMERA_INFERENCE_IMGSZ_EXPLICIT else None)
+            conf = config.CONF_THRESHOLD if config.CONF_THRESHOLD_EXPLICIT else None
             if _debug:
                 print(f"[CameraThread] session={self.session_id} "
                       f"inference worker gen={generation} "
-                      f"backend={backend} frame={w}x{h} "
-                      f"imgsz={config.CAMERA_INFERENCE_IMGSZ}")
+                      f"package={model_state.package_id} frame={w}x{h} imgsz={imgsz}")
 
-            # ── detector.predict() — ONNX RT releases the GIL; preview keeps running ──
+            # ── inference — ONNX RT releases the GIL; preview keeps running ──
             t0 = time.perf_counter()
-            _, detections = detector.predict(
-                frame,
-                conf=config.CONF_THRESHOLD,
-                imgsz=config.CAMERA_INFERENCE_IMGSZ,
-            )
+            result = manager.infer(frame, conf=conf, imgsz=imgsz)
             t_predict = time.perf_counter() - t0
+            counts = result.counts
 
+            # ── scale — non-blocking cached sample; serial I/O stays in the bg poll ──
             t0 = time.perf_counter()
-            counts = detector.count_instruments(detections)
-            t_count = time.perf_counter() - t0
-
-            # ── scale_reader — non-blocking cached read; serial I/O stays in /api/weight ─
-            # read_weight() blocks for up to timeout*retries seconds; get_latest_weight()
-            # returns the last value cached by the /api/weight polling thread instantly.
-            t0 = time.perf_counter()
-            weight = scale_reader.get_latest_weight()
+            sample = web_pkg.scale_reader.get_latest_sample()
+            weight = sample.value
             t_scale = time.perf_counter() - t0
 
             # ── annotated image is intentionally skipped for camera mode ─────────────
-            # The live preview is already the raw camera stream; generating a
-            # segmentation-annotated JPEG here wastes CPU and is never shown.
+            # The live preview is already the raw camera stream; generating an
+            # annotated JPEG here wastes CPU and is never shown.
 
             t0 = time.perf_counter()
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            # Import here (not at module top) to avoid circular import at load time.
-            # class_weights is read-only after startup — no lock needed.
-            import app.web as web_pkg
-            with state_lock:
-                std_snap = dict(standards)
+            std_snap = model_state.standards
+            class_weights = model_state.class_weights
             wv = compute_weight_verification(
-                std_snap, web_pkg.class_weights, weight, config.WEIGHT_TOLERANCE
+                std_snap, class_weights, sample, config.WEIGHT_TOLERANCE
             )
             t_prep = time.perf_counter() - t0
 
@@ -370,53 +490,68 @@ class CameraThread(threading.Thread):
             weight_str = f"{weight:.1f}g" if weight is not None else "None"
             print(
                 f"[CameraThread] session={self.session_id} "
-                f"inference gen={generation} "
-                f"backend={backend} "
+                f"inference gen={generation} model_gen={model_generation} "
+                f"package={model_state.package_id} "
                 f"predict={t_predict*1000:.0f}ms  "
-                f"scale_cached={t_scale*1000:.1f}ms({weight_str})  "
-                f"other={( t_count + t_prep)*1000:.0f}ms  "
+                f"scale_cached={t_scale*1000:.1f}ms({weight_str},"
+                f"{'stable' if sample.stable else sample.reason})  "
+                f"other={(t_prep)*1000:.0f}ms  "
                 f"total={total_ms:.0f}ms  "
-                f"dets={len(detections)}"
+                f"dets={len(result.detections)}"
             )
 
-            # ── discard if camera is stopping, recognition stopped, or generation advanced ──
+            # ── discard if stopping, recognition stopped, recognition generation
+            #    advanced, OR the active model package changed while we ran ──
+            model_changed = manager.generation != model_generation
             with self._lock:
                 stale = (self._stopping
                          or not self._recognition_running
-                         or self._recognition_generation != generation)
+                         or self._recognition_generation != generation
+                         or model_changed)
                 if not stale:
                     self._counts = counts
                     self._weight = weight
                     self._timestamp = ts
                     self._last_detection_ts = ts
+                    self._package_id = model_state.package_id
+                    self._package_display_name = model_state.display_name
+                    self._model_generation = model_generation
                     # _latest_annotated intentionally not set in camera mode
 
             if stale:
+                why = "model package changed" if model_changed else "stale"
                 print(f"[CameraThread] session={self.session_id} "
-                      f"inference DISCARDED (stale) gen={generation}")
-            elif _debug:
+                      f"inference DISCARDED ({why}) gen={generation} "
+                      f"model_gen={model_generation}")
+                return
+            if _debug:
                 print(f"[CameraThread] session={self.session_id} "
                       f"inference PUBLISHED gen={generation}")
 
-            if stale:
-                return
-
-            with state_lock:
+            with web_pkg.state_lock:
                 web_pkg.latest_state.update({
                     "timestamp": ts,
                     "counts": copy.deepcopy(counts),
                     "weight": weight,
                     "annotated_b64": None,  # camera mode: live preview is the raw stream
                     "weight_verification": wv,
+                    "package_id": model_state.package_id,
+                    "package_display_name": model_state.display_name,
+                    "model_generation": model_generation,
                 })
 
-            with state_lock:
-                std_snapshot = dict(standards)
+            web_pkg.register_classes(counts.keys())
+
             record = hist.make_record(
                 source="webcam",
                 counts=counts,
                 weight=weight,
-                standards_snapshot=std_snapshot,
+                standards_snapshot=std_snap,
+                package_id=model_state.package_id,
+                package_display_name=model_state.display_name,
+                model_identity=(result.model_info.identity() if result.model_info else None),
+                class_weights_snapshot=class_weights,
+                weight_verification=wv,
             )
             hist.append_record(record)
 

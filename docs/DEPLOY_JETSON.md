@@ -592,6 +592,48 @@ for k, v in model.names.items():
 PY
 ```
 
+### 器械模型套件
+
+模型不再寫死在程式裡，而是由套件描述：
+
+```
+model_packages/ortho_tka/manifest.json   # adapter、模型檔、推理參數、資料來源
+model_packages/ortho_tka/standards.json  # 出廠預設標準數量（唯讀）
+output/profiles/ortho_tka/standards.json # 現場調整後的標準數量（可編輯）
+```
+
+首次啟動時，若 `output/profiles/<id>/` 不存在，系統會依序從
+「舊版全域 `output/standards.json`」→「套件出廠預設」種入，
+所以既有機器升級後現場設定會保留。
+
+確認與切換：
+
+```bash
+curl -s localhost:5000/api/model-packages | python3 -m json.tool   # 列出所有套件
+curl -s localhost:5000/api/model-package  | python3 -m json.tool   # 目前使用中
+
+# 切換（同步完成才回應，失敗時原套件仍可用）
+curl -s -X POST localhost:5000/api/model-package \
+     -H 'Content-Type: application/json' -d '{"id":"ortho_tka"}'
+```
+
+也可以直接在畫面右上角的「器械套件」下拉選單切換。
+
+新增一個器械套件（例如 Demo 模型）不需要改任何 Python：
+
+1. 放入模型檔（例如 `models/demo/model.onnx`）
+2. 建立 `model_packages/demo/class_weight.json`（每類公克數）
+3. 建立 `model_packages/demo/standards.json`（標準數量）
+4. 編輯 `model_packages/demo/manifest.json`，把 `"template"` 改成 `false`
+5. 用上面的 API 或下拉選單切換過去
+
+詳細欄位說明見 `model_packages/demo/README.md`。
+
+> `adapter` 必須明確指定。副檔名 `.onnx` **不代表**推理方式——
+> 不同 ONNX 模型的輸出張量與後處理完全不同，所以系統絕不從副檔名猜測。
+> 若模型不是 Ultralytics 匯出的，需新增一個 `ModelAdapter` 子類別並用
+> `register_adapter()` 註冊，平台其他程式碼不用動。
+
 ---
 
 ## 9. 攝影機設定
@@ -708,15 +750,39 @@ SERIAL_PORT=/dev/ttyACM0 ./run_jetson.sh
 
 `./run_jetson.sh` 已設定安全的預設值，通常不需要修改。若需要覆蓋，在指令前設定環境變數即可。
 
-### 推理 / 模型
+### 器械模型套件
 
 | 變數 | 預設值 | 說明 |
 |------|--------|------|
-| `DETECTOR_BACKEND` | `onnx` | 推理後端：`onnx`（預設）或 `pt` |
-| `ONNX_MODEL_PATH` | `models/best.onnx` | ONNX 模型路徑 |
-| `STRICT_DETECTOR_BACKEND` | `false` | `true` 時若 ONNX 失敗不自動切換 |
-| `CLASS_WEIGHT_PATH` | `models/class_weight.json` | 器械單位重量設定 |
-| `CONF_THRESHOLD` | `0.25` | 推理信心閾值 |
+| `ACTIVE_MODEL_PACKAGE` | `ortho_tka` | 啟動時載入的器械套件 |
+| `MODEL_PACKAGES_DIR` | `model_packages` | 套件目錄 |
+| `PROFILES_DIR` | `output/profiles` | 各套件的現場設定（標準數量／單重） |
+| `CONF_THRESHOLD` | 由 manifest 決定 | 設定時才覆蓋 manifest 的 `inference.confidence` |
+
+> 模型檔、adapter、task、每類單重、預設標準數量一律由
+> `model_packages/<id>/manifest.json` 決定。
+> `DETECTOR_BACKEND` / `ONNX_MODEL_PATH` / `ONNX_TASK` 僅剩 `app/main.py`
+> 這支獨立 CLI 使用，Web 平台已不再讀取。
+
+### 重量穩定度
+
+| 變數 | 預設值 | 說明 |
+|------|--------|------|
+| `SCALE_STABLE_WINDOW_SEC` | `1.5` | 判定穩定的時間視窗 |
+| `SCALE_STABLE_RANGE_GRAMS` | `1.0` | 視窗內允許的最大波動（公克） |
+| `SCALE_STABLE_MIN_SAMPLES` | `3` | 視窗內最少樣本數 |
+| `SCALE_MAX_SAMPLE_AGE_SEC` | `2.0` | 超過此秒數的快取讀值視為 `fresh=false` |
+| `SCALE_STABLE_MIN_COVERAGE_RATIO` | `0.5` | 樣本需覆蓋視窗的比例 |
+
+> 重量未穩定前不會給出 PASS/FAIL，畫面顯示「量測中」而非紅色「不符合」。
+
+### 攝影機自動復原
+
+| 變數 | 預設值 | 說明 |
+|------|--------|------|
+| `CAMERA_READ_FAIL_THRESHOLD` | `60` | 連續讀取失敗幾次後重開攝影機 |
+| `CAMERA_REOPEN_BACKOFF_SEC` | `1.0` | 重開的起始退避秒數 |
+| `CAMERA_REOPEN_MAX_BACKOFF_SEC` | `15.0` | 退避上限（不會忙碌迴圈） |
 
 ### 攝影機
 

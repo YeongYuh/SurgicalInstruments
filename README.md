@@ -32,11 +32,27 @@ instrument/
 ├── app/
 │   ├── __init__.py
 │   ├── config.py          # Central configuration
-│   ├── detector.py        # YOLO11 inference (image path or numpy frame)
+│   ├── inference/         # Model-agnostic layer — no ML runtime leaks above this
+│   │   ├── types.py       #   Detection / InferenceResult / ModelInfo
+│   │   ├── base.py        #   ModelAdapter contract
+│   │   ├── registry.py    #   adapter name -> class
+│   │   ├── package.py     #   manifest parsing + validation
+│   │   ├── profile.py     #   per-package standards / unit weights
+│   │   ├── manager.py     #   ModelManager: one active model, atomic switching
+│   │   └── adapters/
+│   │       └── ultralytics_adapter.py   # the only file that imports YOLO
+│   ├── scale_sample.py    # Sample timestamps, freshness, stability
 │   ├── scale_reader.py    # Mock / Serial scale reader
-│   ├── weight_checker.py  # Weight verification logic
+│   ├── weight_verification.py  # Standard weight + stability gate
+│   ├── detector.py        # Legacy facade over UltralyticsAdapter (CLI only)
+│   ├── weight_checker.py  # Weight verification logic (CLI only)
 │   ├── visualizer.py      # OpenCV annotation, overlay, save
+│   ├── web/               # Flask platform: camera, routes, history, reports
 │   └── main.py            # Entry point (argparse, image + webcam modes)
+├── model_packages/
+│   ├── ortho_tka/         # production package: manifest + factory standards
+│   └── demo/              # template — fill in and set "template": false
+├── tests/                 # pytest suite (FakeAdapter, no hardware required)
 ├── models/
 │   └── best.pt            # ← place your trained model here
 ├── input/
@@ -347,15 +363,70 @@ CAMERA_FOURCC=MJPG ./run_jetson.sh   # if your camera works better with MJPG
 CAMERA_FOURCC=AUTO ./run_jetson.sh   # let the driver decide
 ```
 
-### Detector backend — ONNX vs PyTorch
+### Model packages — swapping the instrument family
 
-The default backend is **ONNX** (`CPUExecutionProvider`), benchmarked at ~3.9× faster
-than PyTorch on the Jetson Nano CPU:
+The platform (camera, scale, weight verification, inventory comparison, UI,
+history, reports, hardware recovery) is fixed.  The **model** is pluggable:
 
-| Backend | `detector.predict()` | Notes |
-|---------|----------------------|-------|
-| `onnx` (default) | ~1.6 s/frame | ONNX Runtime, `CPUExecutionProvider` |
-| `pt` | ~6.3 s/frame | PyTorch / Ultralytics |
+```
+model_packages/<id>/manifest.json    which adapter, which model file, defaults
+model_packages/<id>/standards.json   factory-default expected quantities
+```
+
+The manifest is the source of truth — not environment variables:
+
+```json
+{
+  "schema_version": 1,
+  "id": "ortho_tka",
+  "display_name": "骨科 TKA 器械組",
+  "department": "orthopedics",
+  "adapter": "ultralytics",
+  "model_file": "models/best.onnx",
+  "fallback_model_file": "models/best.pt",
+  "adapter_options": { "task": "segment" },
+  "inference": { "confidence": 0.25, "image_size": 640 },
+  "inventory": {
+    "class_weights": "models/class_weight.json",
+    "default_standards": "model_packages/ortho_tka/standards.json"
+  }
+}
+```
+
+Select one at startup, or switch at runtime from the header dropdown:
+
+```bash
+ACTIVE_MODEL_PACKAGE=ortho_tka ./run_jetson.sh
+
+curl -s localhost:5000/api/model-packages                       # list
+curl -s -X POST localhost:5000/api/model-package \
+     -H 'Content-Type: application/json' -d '{"id":"ortho_tka"}' # switch
+```
+
+Switching is atomic: the new model is loaded and warmed *before* the swap, so a
+failure leaves the previous package serving.  Results from the old package are
+discarded rather than reinterpreted under the new one's standards.
+
+`adapter` must always be named explicitly.  **`.onnx` is a serialization format,
+not an inference contract** — two ONNX files can need entirely different
+post-processing, so the adapter is never guessed from the file extension.  A
+model that is not an Ultralytics export needs a new `ModelAdapter` subclass
+registered with `register_adapter()`; no platform code changes.
+
+Per-package operator configuration is isolated under
+`output/profiles/<id>/standards.json` — orthopaedic standards can never be
+applied to an obstetric tray.  The package's own `standards.json` stays a
+read-only factory default.
+
+### Inference backend
+
+`ortho_tka` runs **ONNX** (`CPUExecutionProvider`), benchmarked ~3.9× faster than
+PyTorch on the Jetson Nano CPU:
+
+| Backend | per frame | Notes |
+|---------|-----------|-------|
+| `onnx` (default) | ~1.6 s | ONNX Runtime, `CPUExecutionProvider` |
+| `pt` | ~6.3 s | PyTorch / Ultralytics |
 
 `best.onnx` must be generated once before use (already present if setup was followed):
 
@@ -364,16 +435,37 @@ source venv/bin/activate
 python3 -c "from ultralytics import YOLO; YOLO('models/best.pt').export(format='onnx', opset=12)"
 ```
 
-If `models/best.onnx` is missing at startup, the app falls back to `models/best.pt`
-automatically with a log warning.  Set `STRICT_DETECTOR_BACKEND=true` to disable fallback.
+If `model_file` is missing at startup the adapter falls back to
+`fallback_model_file` with a log warning; set `"strict": true` in
+`adapter_options` to fail instead.
 
-To force PyTorch:
+> The legacy `DETECTOR_BACKEND` / `ONNX_MODEL_PATH` / `ONNX_TASK` env vars now
+> apply only to the standalone `app/main.py` CLI.  The web platform reads the
+> manifest.
+
+TensorRT (`.engine`) remains a future optimization path — it would be a new
+adapter plus a manifest change, not a core rewrite.
+
+### Weight stability gate
+
+A PASS/FAIL verdict is only issued once the scale reading is both **fresh** and
+**stable**.  Until then the UI shows 量測中 and `weight_verification.passed` is
+`null` — an unsettled scale is an unfinished measurement, not a failed
+inventory.  Tunable via `SCALE_STABLE_*` (see `.env.example`).
+
+Once the scale stops reporting (cable pulled, board reset) the cached value is
+reported with `fresh: false` and can no longer be verified, so a stale number
+never passes for a live one.
+
+### Tests
 
 ```bash
-DETECTOR_BACKEND=pt ./run_jetson.sh
+pip install -r requirements-dev.txt
+python3 -m pytest
 ```
 
-TensorRT (`.engine`) remains a future optimization path for additional speedup.
+The suite runs entirely on a FakeAdapter and temporary packages, so it needs no
+model binary, camera, or scale.
 
 ### Verified Jetson Nano scale configuration
 

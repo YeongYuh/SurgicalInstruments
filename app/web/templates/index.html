@@ -16,6 +16,11 @@
         <div id="logo-icon">囧</div>
         <span>手術器械智能盤點系統</span>
       </div>
+      <div id="package-bar">
+        <label for="package-select">器械套件</label>
+        <select id="package-select" onchange="onPackageChange(event)"></select>
+        <span id="package-status"></span>
+      </div>
     </header>
 
     <!-- ── Main ───────────────────────────────────────────────────────── -->
@@ -139,7 +144,7 @@
                 <div class="stat-num stat-wt-num" id="stat-act-wt">—</div>
               </div>
               <div class="stat-box weight-ok-box" id="stat-wt-ok-box">
-                <div class="stat-label">重量符合</div>
+                <div class="stat-label">重量狀態</div>
                 <div class="stat-num" id="stat-wt-ok">—</div>
               </div>
             </div>

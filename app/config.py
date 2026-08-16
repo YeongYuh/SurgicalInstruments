@@ -1,19 +1,45 @@
 import os
+from pathlib import Path
+
+# Repository root — model package manifests resolve their relative paths
+# against this, so the app behaves the same regardless of the caller's cwd.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _env_is_set(name: str) -> bool:
+    """True only when the variable was explicitly provided by the environment."""
+    return name in os.environ and os.environ[name] != ""
+
 
 # Paths
 MODEL_PATH = os.environ.get("MODEL_PATH", "models/best.pt")
 INPUT_PATH = os.environ.get("INPUT_PATH", "input/test_image.jpg")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
 
-# Detection
+# ── Model packages ───────────────────────────────────────────────────────────
+# A model package bundles a manifest, an adapter name, a model file reference,
+# per-class weights, and factory-default standards.  Switching instrument
+# families (orthopaedics -> obstetrics -> ...) means switching packages, not
+# editing platform code.
+MODEL_PACKAGES_DIR   = os.environ.get("MODEL_PACKAGES_DIR", str(PROJECT_ROOT / "model_packages"))
+ACTIVE_MODEL_PACKAGE = os.environ.get("ACTIVE_MODEL_PACKAGE", "ortho_tka")
+# Per-package operator-editable configuration lives here.
+PROFILES_DIR = os.environ.get("PROFILES_DIR", os.path.join(OUTPUT_DIR, "profiles"))
+# The package that inherits the pre-package global output/standards.json and
+# output/unit_weights.json on first start, so an in-service unit keeps its site
+# configuration across the upgrade.
+LEGACY_PACKAGE_ID = os.environ.get("LEGACY_PACKAGE_ID", "ortho_tka")
+
+# Detection — manifest ``inference.confidence`` is the source of truth; this env
+# var overrides it only when explicitly set.
 CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.25"))
+CONF_THRESHOLD_EXPLICIT = _env_is_set("CONF_THRESHOLD")
 
-# Per-class unit weight file (maps class name → grams per instrument)
-CLASS_WEIGHT_PATH = os.environ.get("CLASS_WEIGHT_PATH", "models/class_weight.json")
-
-# Detector backend — "pt" (default) or "onnx"
-# ONNX is ~3x faster on CPU (onnxruntime CPUExecutionProvider).
-# Set STRICT_DETECTOR_BACKEND=true to crash instead of falling back to .pt.
+# ── Legacy model configuration (CLI only) ────────────────────────────────────
+# app/main.py (the standalone image/webcam CLI) still uses these.  The web
+# platform ignores them: the active package manifest decides the adapter, the
+# model file, and the task.
+CLASS_WEIGHT_PATH       = os.environ.get("CLASS_WEIGHT_PATH", "models/class_weight.json")
 DETECTOR_BACKEND        = os.environ.get("DETECTOR_BACKEND", "pt")
 ONNX_MODEL_PATH         = os.environ.get("ONNX_MODEL_PATH", "models/best.onnx")
 ONNX_TASK               = os.environ.get("ONNX_TASK", "segment")
@@ -56,6 +82,20 @@ SCALE_TRANSITION_THRESHOLD_GRAMS = float(os.environ.get("SCALE_TRANSITION_THRESH
 # Log every raw/filtered sample when true.
 SCALE_DEBUG                = os.environ.get("SCALE_DEBUG", "false").lower() == "true"
 
+# ── Scale stability gate ─────────────────────────────────────────────────────
+# A PASS/FAIL verdict is only issued for a reading that is both fresh and
+# settled.  At the default 10 Hz background poll, a 1.5 s window holds ~15
+# samples; stability needs at least SCALE_STABLE_MIN_SAMPLES of them spanning at
+# least SCALE_STABLE_MIN_COVERAGE_RATIO of the window, with a spread no larger
+# than SCALE_STABLE_RANGE_GRAMS.
+SCALE_STABLE_WINDOW_SEC        = float(os.environ.get("SCALE_STABLE_WINDOW_SEC", "1.5"))
+SCALE_STABLE_RANGE_GRAMS       = float(os.environ.get("SCALE_STABLE_RANGE_GRAMS", "1.0"))
+SCALE_STABLE_MIN_SAMPLES       = int(os.environ.get("SCALE_STABLE_MIN_SAMPLES", "3"))
+# Beyond this age the cached reading is reported fresh=false — a cached value
+# must never masquerade as a live measurement after the scale is unplugged.
+SCALE_MAX_SAMPLE_AGE_SEC       = float(os.environ.get("SCALE_MAX_SAMPLE_AGE_SEC", "2.0"))
+SCALE_STABLE_MIN_COVERAGE_RATIO = float(os.environ.get("SCALE_STABLE_MIN_COVERAGE_RATIO", "0.5"))
+
 # Source type — "image" | "webcam"
 SOURCE_TYPE = os.environ.get("SOURCE_TYPE", "image")
 
@@ -91,8 +131,18 @@ WEBCAM_DETECTION_INTERVAL = float(os.environ.get("WEBCAM_DETECTION_INTERVAL", "5
 WEBCAM_SAVE_FRAMES        = os.environ.get("WEBCAM_SAVE_FRAMES", "false").lower() == "true"
 # Inference image size for camera recognition (width=height).
 # Smaller values reduce CPU cost: 640 (full, default), 416, 320.
-# Upload inference always uses 640 regardless of this setting.
+# Upload inference always uses the package's own image size.
 CAMERA_INFERENCE_IMGSZ    = int(os.environ.get("CAMERA_INFERENCE_IMGSZ", "640"))
+CAMERA_INFERENCE_IMGSZ_EXPLICIT = _env_is_set("CAMERA_INFERENCE_IMGSZ")
+
+# ── Camera runtime recovery ──────────────────────────────────────────────────
+# A USB camera can stop delivering frames while the device node stays open —
+# the capture thread lives on but nothing ever arrives.  After this many
+# consecutive cap.read() failures the capture is released and reopened with a
+# bounded exponential backoff (interruptible by stop()).
+CAMERA_READ_FAIL_THRESHOLD   = int(os.environ.get("CAMERA_READ_FAIL_THRESHOLD", "60"))
+CAMERA_REOPEN_BACKOFF_SEC    = float(os.environ.get("CAMERA_REOPEN_BACKOFF_SEC", "1.0"))
+CAMERA_REOPEN_MAX_BACKOFF_SEC = float(os.environ.get("CAMERA_REOPEN_MAX_BACKOFF_SEC", "15.0"))
 
 # Web server
 BACKEND_HOST = os.environ.get("BACKEND_HOST", "0.0.0.0")
@@ -102,3 +152,7 @@ BACKEND_PORT = int(os.environ.get("BACKEND_PORT", "5000"))
 # Set ENABLE_SYSTEM_SHUTDOWN=true AND configure sudoers (see docs/DEPLOY_JETSON.md)
 # before enabling.  When false the route returns an error without touching hardware.
 ENABLE_SYSTEM_SHUTDOWN = os.environ.get("ENABLE_SYSTEM_SHUTDOWN", "false").lower() == "true"
+
+# Skip the background model load / scale warmup threads.  Set by the test suite
+# so importing app.web never touches hardware or a real model.
+DISABLE_BOOTSTRAP = os.environ.get("INSTRUMENT_DISABLE_BOOTSTRAP", "false").lower() == "true"

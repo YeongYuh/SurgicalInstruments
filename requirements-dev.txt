@@ -1,0 +1,5 @@
+# Test-only dependencies.  NOT needed on the Jetson to run the platform —
+# install with:  pip install -r requirements-dev.txt
+-r requirements.txt
+
+pytest>=7.0

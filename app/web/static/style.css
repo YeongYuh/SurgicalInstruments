@@ -43,6 +43,33 @@ body {
   color: #c9d1d9;
 }
 
+/* Active model package selector — which instrument family is loaded */
+#package-bar {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #8b949e;
+}
+
+#package-select {
+  background: #21262d;
+  color: #c9d1d9;
+  border: 1px solid #2d3448;
+  border-radius: 5px;
+  padding: 3px 8px;
+  font-size: 12px;
+  max-width: 220px;
+}
+
+#package-select:disabled { opacity: 0.55; cursor: progress; }
+
+#package-status { font-size: 11px; min-width: 60px; }
+#package-status.busy   { color: #d0a215; }
+#package-status.error  { color: #f44336; }
+#package-status.ok     { color: #4caf50; }
+
 #logo-icon {
   width: 28px;
   height: 28px;
@@ -360,6 +387,10 @@ body {
 .weight-ok-box .stat-num { color: #8b949e; }
 .weight-ok-box.passed .stat-num { color: #4caf50; }
 .weight-ok-box.failed .stat-num { color: #f44336; }
+/* Measurement not finished yet — amber, never the red FAIL colour. */
+.weight-ok-box.measuring { background: #3a3218; }
+.weight-ok-box.measuring .stat-num { color: #d0a215; }
+.weight-ok-box.waiting .stat-num { color: #8b949e; }
 .stat-wt-num { font-size: 17px !important; }
 
 

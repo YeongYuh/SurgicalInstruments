@@ -1,24 +1,53 @@
+"""Shared singletons for the Flask platform.
+
+The platform owns hardware and workflow: camera, scale, weight verification,
+inventory comparison, history, reports.  It does NOT own a model — that comes
+from whichever Model Package is active, through ModelManager.
+
+Nothing in this package imports ultralytics, torch, or onnxruntime.
+"""
+
 from __future__ import annotations
 
 import atexit
-import json
+import logging
 import threading
 from pathlib import Path
+from typing import Any, Dict, Iterable, Optional
 
 from flask import Flask
 
 import app.config as config
-from app.detector import SurgicalInstrumentDetector
+from app.inference import ModelManager, ModelManagerError
 from app.scale_reader import create_scale_reader
+from app.weight_verification import compute_weight_verification  # re-exported
 
-# ── Shared singletons ────────────────────────────────────────────────────────
-detector = SurgicalInstrumentDetector(
-    model_path=config.MODEL_PATH,
-    backend=config.DETECTOR_BACKEND,
-    onnx_path=config.ONNX_MODEL_PATH,
-    onnx_task=config.ONNX_TASK,
+logger = logging.getLogger(__name__)
+
+# ── Model packages ───────────────────────────────────────────────────────────
+_OUTPUT_DIR = Path(config.OUTPUT_DIR)
+
+model_manager = ModelManager(
+    packages_dir=Path(config.MODEL_PACKAGES_DIR),
+    profiles_dir=Path(config.PROFILES_DIR),
+    project_root=config.PROJECT_ROOT,
+    legacy_package_id=config.LEGACY_PACKAGE_ID,
+    legacy_standards_path=_OUTPUT_DIR / "standards.json",
+    legacy_unit_weights_path=_OUTPUT_DIR / "unit_weights.json",
 )
+model_manager.discover(force=True)
 
+if not config.DISABLE_BOOTSTRAP:
+    # Publishes the manifest + profile synchronously (JSON only, so /standards
+    # answers immediately) and loads the model in the background, exactly like
+    # the previous detector warmup thread.
+    if model_manager.bootstrap(config.ACTIVE_MODEL_PACKAGE) is None:
+        logger.error(
+            "[startup] no active model package — set ACTIVE_MODEL_PACKAGE to one of: %s",
+            ", ".join(sorted(model_manager.discover(force=False))) or "(none discovered)",
+        )
+
+# ── Scale ────────────────────────────────────────────────────────────────────
 scale_reader = create_scale_reader(
     mode=config.SCALE_READER_MODE,
     mock_weight=config.MOCK_WEIGHT,
@@ -31,149 +60,116 @@ scale_reader = create_scale_reader(
     filter_window=config.SCALE_FILTER_WINDOW,
     transition_threshold=config.SCALE_TRANSITION_THRESHOLD_GRAMS,
     debug=config.SCALE_DEBUG,
+    stable_window_sec=config.SCALE_STABLE_WINDOW_SEC,
+    stable_range_grams=config.SCALE_STABLE_RANGE_GRAMS,
+    stable_min_samples=config.SCALE_STABLE_MIN_SAMPLES,
+    max_sample_age_sec=config.SCALE_MAX_SAMPLE_AGE_SEC,
+    stable_min_coverage_ratio=config.SCALE_STABLE_MIN_COVERAGE_RATIO,
 )
 atexit.register(scale_reader.close)
 
-# For serial mode: open the port now in a background thread so the Arduino
-# reset-on-DTR initialization (~3 s) completes during app startup rather than
-# blocking the user's first upload request.
-if config.SCALE_READER_MODE == "serial":
+if config.SCALE_READER_MODE == "serial" and not config.DISABLE_BOOTSTRAP:
+    # Open the port now so the Arduino reset-on-DTR delay (~3 s) is paid during
+    # startup rather than on the operator's first upload.
     def _warmup_scale() -> None:
-        scale_reader.read_weight()  # triggers lazy connect + drains startup buffer
+        scale_reader.read_weight()
 
     threading.Thread(target=_warmup_scale, name="scale-warmup", daemon=True).start()
 
-# Load the detector model (PT or ONNX) in the background at startup so the
-# first user upload is not stalled by a cold-load delay (~1-10 s).
-import logging as _logging
-import numpy as _np
-_det_logger = _logging.getLogger(__name__)
-
-def _warmup_detector() -> None:
-    import time as _time
-    t0 = _time.perf_counter()
-    dummy = _np.zeros((64, 64, 3), dtype=_np.uint8)
-    try:
-        detector.predict(dummy, conf=0.25)
-        ms = (_time.perf_counter() - t0) * 1000
-        _det_logger.info("[Detector] Warmup done — backend=%s  %.0f ms", detector._effective_backend, ms)
-    except Exception as exc:
-        _det_logger.warning("[Detector] Warmup failed: %s", exc)
-
-threading.Thread(target=_warmup_detector, name="detector-warmup", daemon=True).start()
-
-# Per-class expected counts — loaded from disk, editable at runtime
-_STANDARDS_FILE = Path(config.OUTPUT_DIR) / "standards.json"
-standards: dict[str, int] = {}
-if _STANDARDS_FILE.exists():
-    try:
-        standards = json.loads(_STANDARDS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        standards = {}
-
-# Per-class unit weight (g/unit) — loaded from disk, editable at runtime
-_UNIT_WEIGHTS_FILE = Path(config.OUTPUT_DIR) / "unit_weights.json"
-unit_weights: dict[str, float] = {}
-if _UNIT_WEIGHTS_FILE.exists():
-    try:
-        unit_weights = json.loads(_UNIT_WEIGHTS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        unit_weights = {}
-
-# Per-class instrument weight from model definition — read-only source of truth
-# for standard weight calculation (标准重量).
-# Loaded once at startup from CLASS_WEIGHT_PATH (default: models/class_weight.json).
-_CLASS_WEIGHT_PATH = Path(config.CLASS_WEIGHT_PATH)
-_cw_logger = _logging.getLogger(__name__)
-class_weights: dict[str, float] = {}
-if _CLASS_WEIGHT_PATH.exists():
-    try:
-        _raw_cw = json.loads(_CLASS_WEIGHT_PATH.read_text(encoding="utf-8"))
-        class_weights = {str(k): float(v) for k, v in _raw_cw.items()}
-        _cw_logger.info(
-            "[class_weights] loaded %d classes from %s",
-            len(class_weights), _CLASS_WEIGHT_PATH,
-        )
-    except Exception as _exc:
-        _cw_logger.warning(
-            "[class_weights] failed to load %s: %s — standard weight will be 0",
-            _CLASS_WEIGHT_PATH, _exc,
-        )
-else:
-    _cw_logger.warning(
-        "[class_weights] %s not found — standard weight will be 0", _CLASS_WEIGHT_PATH,
-    )
-
+# ── Shared runtime state ─────────────────────────────────────────────────────
 state_lock = threading.Lock()
 
-# Serialises camera start and stop operations so that a new open can never race
-# with an in-progress cap.release().  Both /camera/start and /camera/stop acquire
-# this lock for the duration of their device-level work (but NOT during
-# wait_until_ready, so the UI is not frozen while the camera warms up).
+# Serialises camera start and stop so a new open can never race an in-progress
+# cap.release().  Both /camera/start and /camera/stop hold it for their
+# device-level work, but NOT during wait_until_ready, so the UI is not frozen
+# while the camera warms up.
 _camera_lifecycle_lock = threading.Lock()
 
-# Camera thread — set by routes.py after start
 camera_thread = None  # type: ignore[assignment]
-camera_session_id: int = 0  # incremented on each successful start
+camera_session_id: int = 0
 
-# Latest inference result shared between camera thread and /status route
-latest_state: dict = {
+latest_state: Dict[str, Any] = {
     "timestamp": "",
     "counts": {},
     "weight": None,
     "annotated_b64": None,
     "weight_verification": None,
+    "package_id": None,
+    "package_display_name": None,
+    "model_generation": 0,
 }
 
 
-# ── Shared utility ───────────────────────────────────────────────────────────
+def reset_latest_state() -> None:
+    """Clear inference state left over from another model package.
 
-def compute_weight_verification(
-    standards: dict,
-    unit_weights: dict,
-    actual_weight: float | None,
-    tolerance: float,
-) -> dict:
-    """Calculate expected weight from standards × unit weights and compare with actual scale reading.
-
-    Callers should pass class_weights (from class_weight.json) as unit_weights so
-    that standard weight is derived from the model definition rather than the
-    user-editable output/unit_weights.json file.
-
-    Classes present in standards but absent from unit_weights are logged as
-    warnings and contribute 0 g (no crash).
+    Called on every package switch: counts produced by the orthopaedic model
+    are meaningless under obstetric standards, so they must not survive.
     """
-    _wv_log = _logging.getLogger(__name__)
-    expected = 0.0
-    for cls, std_qty in standards.items():
-        qty = int(std_qty or 0)
-        if qty == 0:
-            continue
-        if cls not in unit_weights:
-            _wv_log.warning(
-                "[weight_verification] class '%s' (std=%d) not in class_weight.json — 0 g",
-                cls, qty,
-            )
-            continue
-        expected += qty * float(unit_weights[cls])
-    if actual_weight is None:
-        return {
-            "passed": False,
-            "expected": round(expected, 4),
-            "actual": None,
-            "difference": None,
-            "tolerance": tolerance,
-            "message": "無法讀取重量",
-        }
-    diff = abs(actual_weight - expected)
-    passed = diff <= tolerance
+    with state_lock:
+        latest_state.update({
+            "timestamp": "",
+            "counts": {},
+            "weight": None,
+            "annotated_b64": None,
+            "weight_verification": None,
+            "package_id": None,
+            "package_display_name": None,
+            "model_generation": model_manager.generation,
+        })
+
+
+# ── Package-scoped inventory accessors ───────────────────────────────────────
+# Always fetch through these.  Holding on to a dict returned by the profile is
+# fine (it is a copy); holding a reference to the profile itself across a
+# package switch is not, which is why no caller is given one.
+
+def active_profile():
+    return model_manager.active_profile
+
+
+def get_standards() -> Dict[str, int]:
+    profile = model_manager.active_profile
+    return profile.standards if profile is not None else {}
+
+
+def get_unit_weights() -> Dict[str, float]:
+    profile = model_manager.active_profile
+    return profile.unit_weights if profile is not None else {}
+
+
+def get_class_weights() -> Dict[str, float]:
+    profile = model_manager.active_profile
+    return profile.class_weights if profile is not None else {}
+
+
+def update_standards(values: Dict[str, Any]) -> Dict[str, int]:
+    profile = model_manager.active_profile
+    if profile is None:
+        raise ModelManagerError("no active model package — cannot edit standards")
+    return profile.update_standards(values)
+
+
+def update_unit_weights(values: Dict[str, Any]) -> Dict[str, float]:
+    profile = model_manager.active_profile
+    if profile is None:
+        raise ModelManagerError("no active model package — cannot edit unit weights")
+    return profile.update_unit_weights(values)
+
+
+def register_classes(class_names: Iterable[str]) -> bool:
+    """Register model output classes the operator has not configured yet."""
+    profile = model_manager.active_profile
+    if profile is None:
+        return False
+    return profile.register_classes(class_names)
+
+
+def package_identity() -> Dict[str, Optional[str]]:
+    state = model_manager.state()
     return {
-        "passed": passed,
-        "expected": round(expected, 4),
-        "actual": round(actual_weight, 4),
-        "difference": round(diff, 4),
-        "tolerance": tolerance,
-        "message": "重量在容許範圍內" if passed else "重量超出容許範圍",
+        "package_id": state.package_id or None,
+        "package_display_name": state.display_name or None,
     }
 
 
@@ -185,4 +181,4 @@ app = Flask(
 )
 app.config['TEMPLATES_AUTO_RELOAD'] = True  # re-read templates from disk on every request
 
-from app.web import routes  # noqa: E402, F401  (registers blueprints)
+from app.web import routes  # noqa: E402, F401  (registers routes)

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+
+  "id": "ortho_tka",
+  "display_name": "骨科 TKA 器械組",
+  "department": "orthopedics",
+
+  "adapter": "ultralytics",
+
+  "model_file": "models/best.onnx",
+  "fallback_model_file": "models/best.pt",
+
+  "adapter_options": {
+    "task": "segment",
+    "strict": false,
+    "include_masks": false
+  },
+
+  "inference": {
+    "confidence": 0.25,
+    "image_size": 640
+  },
+
+  "inventory": {
+    "class_weights": "models/class_weight.json",
+    "default_standards": "model_packages/ortho_tka/standards.json"
+  }
+}
