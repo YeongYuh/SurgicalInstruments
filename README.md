@@ -393,10 +393,18 @@ The manifest is the source of truth — not environment variables:
 }
 ```
 
-Select one at startup, or switch at runtime from the header dropdown:
+Select one at startup, or switch at runtime from the header dropdown.
+
+`./run_jetson.sh` with no overrides starts the `demo` package on its `SurgeryB`
+tray. `STARTUP_INVENTORY_PRESET` forces that tray on every boot — without it the
+unit resumes whichever surgery the last operator selected. Set it to the empty
+string to keep that resume behaviour instead:
 
 ```bash
-ACTIVE_MODEL_PACKAGE=ortho_tka ./run_jetson.sh
+./run_jetson.sh                                            # demo + SurgeryB
+ACTIVE_MODEL_PACKAGE=ortho_tka ./run_jetson.sh             # ortho, no preset forced
+STARTUP_INVENTORY_PRESET=SurgeryC ./run_jetson.sh          # demo + SurgeryC
+STARTUP_INVENTORY_PRESET= ./run_jetson.sh                  # demo, resume last preset
 
 curl -s localhost:5000/api/model-packages                       # list
 curl -s -X POST localhost:5000/api/model-package \

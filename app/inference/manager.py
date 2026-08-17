@@ -753,7 +753,47 @@ class ModelManager:
             logger.info("[models] package '%s' active — generation=%d", package.id, generation)
             return self.state()
 
-    def bootstrap(self, package_id: str, *, background: bool = True) -> Optional[ActiveState]:
+    def _apply_startup_preset(self, profile: PackageProfile,
+                              startup_preset: Optional[str]) -> None:
+        """Force a named tray at process start, before anything is published.
+
+        The profile restores whichever preset was active when the unit was last
+        shut down.  A theatre that is configured to always begin a session on
+        one tray needs the opposite: a known state on every boot, regardless of
+        where the previous operator left it.
+
+        Applied here — inside the switch lock, before ``_publish`` — so no
+        request, and no inference, can ever observe the restored preset first.
+        A misconfiguration is reported loudly and startup continues: a kiosk
+        that refuses to boot is worse than one showing the wrong tray, but it
+        must never be silent about which it is doing.
+        """
+        if not startup_preset:
+            return
+        if not profile.has_presets:
+            logger.error(
+                "[startup] STARTUP_INVENTORY_PRESET='%s' ignored — package '%s' "
+                "offers no surgery presets. Unset it, or start a package that "
+                "has presets.", startup_preset, profile.package_id)
+            return
+        if startup_preset not in profile.preset_names:
+            logger.error(
+                "[startup] STARTUP_INVENTORY_PRESET='%s' is NOT a preset of "
+                "package '%s' — available: %s. The startup preset was NOT "
+                "applied; the package kept active_preset=%r. Fix the "
+                "STARTUP_INVENTORY_PRESET value.",
+                startup_preset, profile.package_id,
+                ", ".join(profile.preset_names), profile.active_preset)
+            return
+
+        previous = profile.active_preset
+        profile.apply_preset(startup_preset)
+        logger.info("[startup] package '%s' forced to preset '%s' "
+                    "(was %r on disk)",
+                    profile.package_id, startup_preset, previous)
+
+    def bootstrap(self, package_id: str, *, background: bool = True,
+                  startup_preset: Optional[str] = None) -> Optional[ActiveState]:
         """Startup activation.
 
         The manifest and profile are published synchronously (cheap — JSON
@@ -764,6 +804,10 @@ class ModelManager:
 
         Until the load finishes ``ActiveState.ready`` is False and /status
         reports ``model_loading``, so nothing claims the model is usable yet.
+
+        ``startup_preset`` forces a named tray for this boot; see
+        ``_apply_startup_preset``.  It changes standards only — the model is
+        published exactly once either way, so no extra load or generation bump.
         """
         with self._switch_lock:
             try:
@@ -771,6 +815,10 @@ class ModelManager:
                 package = self._resolve_for_activation(package_id)
                 adapter_cls = get_adapter_class(package.adapter)
                 profile = self._load_profile_for(package)
+                # Before _publish: the first state anyone can observe already
+                # carries the startup tray, so the UI never shows the restored
+                # preset and then jumps.
+                self._apply_startup_preset(profile, startup_preset)
             except (ModelManagerError, UnknownAdapterError) as exc:
                 with self._state_lock:
                     self._last_error = str(exc)

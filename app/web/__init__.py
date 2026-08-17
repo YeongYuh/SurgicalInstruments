@@ -41,7 +41,10 @@ if not config.DISABLE_BOOTSTRAP:
     # Publishes the manifest + profile synchronously (JSON only, so /standards
     # answers immediately) and loads the model in the background, exactly like
     # the previous detector warmup thread.
-    if model_manager.bootstrap(config.ACTIVE_MODEL_PACKAGE) is None:
+    if model_manager.bootstrap(
+        config.ACTIVE_MODEL_PACKAGE,
+        startup_preset=config.STARTUP_INVENTORY_PRESET,
+    ) is None:
         logger.error(
             "[startup] no active model package — set ACTIVE_MODEL_PACKAGE to one of: %s",
             ", ".join(sorted(model_manager.discover(force=False))) or "(none discovered)",

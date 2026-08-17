@@ -31,9 +31,28 @@ export SERIAL_BAUDRATE="${SERIAL_BAUDRATE:-9600}"
 # Which surgical instrument family to load.  The package manifest under
 # model_packages/<id>/manifest.json is the source of truth for the adapter, the
 # model file, the per-class weights, and the default standards.
-#   ACTIVE_MODEL_PACKAGE=demo ./run_jetson.sh
-export ACTIVE_MODEL_PACKAGE="${ACTIVE_MODEL_PACKAGE:-ortho_tka}"
+#   ACTIVE_MODEL_PACKAGE=ortho_tka ./run_jetson.sh
+export ACTIVE_MODEL_PACKAGE="${ACTIVE_MODEL_PACKAGE:-demo}"
 export MODEL_PACKAGES_DIR="${MODEL_PACKAGES_DIR:-$(pwd)/model_packages}"
+
+# ── Startup surgery preset ────────────────────────────────────────────────────
+# Forces a named tray on every boot, so the unit always starts in a known state
+# rather than wherever the last operator left it.  The default is PAIRED with
+# the default package: asking for demo's SurgeryB while running ortho_tka would
+# be a misconfiguration, so only demo gets a default.
+#
+# Set it explicitly to override, including to the empty string, which means
+# "don't force anything — keep whatever the profile restored":
+#   STARTUP_INVENTORY_PRESET=SurgeryC ./run_jetson.sh
+#   STARTUP_INVENTORY_PRESET= ./run_jetson.sh
+if [ -z "${STARTUP_INVENTORY_PRESET+isset}" ]; then
+  if [ "$ACTIVE_MODEL_PACKAGE" = "demo" ]; then
+    STARTUP_INVENTORY_PRESET="SurgeryB"
+  else
+    STARTUP_INVENTORY_PRESET=""
+  fi
+fi
+export STARTUP_INVENTORY_PRESET
 
 # ── Camera source (integer index or /dev/videoN path) ────────────────────────
 # Default to path-based open — more reliable than integer index on Jetson OpenCV.
@@ -130,6 +149,26 @@ try:
                 print(f"               -> export best.onnx: python3 -c \"from ultralytics import "
                       f"YOLO; YOLO('models/best.pt').export(format='onnx', opset=12)\"")
         print(f"  Weights    : {pkg.class_weights_path}")
+
+        # Startup preset — validated here so a typo is visible at boot rather
+        # than only as one ERROR line buried in the journal.
+        startup_preset = os.environ.get("STARTUP_INVENTORY_PRESET", "").strip()
+        if not startup_preset:
+            print(f"  Startup preset : (none — keeps the preset restored from disk)")
+        else:
+            try:
+                names = sorted(pkg.load_presets()) if pkg.has_presets else []
+            except Exception as exc:
+                names = []
+                print(f"  [WARNING]  cannot read presets: {exc}")
+            print(f"  Startup preset : {startup_preset}")
+            if not names:
+                print(f"  [ERROR]    package '{pkg.id}' has no surgery presets —")
+                print(f"             STARTUP_INVENTORY_PRESET='{startup_preset}' will be IGNORED")
+            elif startup_preset not in names:
+                print(f"  [ERROR]    '{startup_preset}' is not a preset of '{pkg.id}'")
+                print(f"             available: {', '.join(names)}")
+                print(f"             -> the startup preset will NOT be applied")
 except Exception as exc:
     print(f"  [ERROR]    Cannot read model packages: {exc}")
 
@@ -200,6 +239,7 @@ PORT="${BACKEND_PORT:-5000}"
 
 echo ""
 echo "Package  : ${ACTIVE_MODEL_PACKAGE}  (dir=${MODEL_PACKAGES_DIR})"
+echo "Startup preset : ${STARTUP_INVENTORY_PRESET:-(none)}"
 echo "Scale    : ${SCALE_READER_MODE}  port=${SERIAL_PORT}  baud=${SERIAL_BAUDRATE}"
 echo "Camera   : source=${CAMERA_SOURCE}  detect_interval=${WEBCAM_DETECTION_INTERVAL}s"
 echo ""

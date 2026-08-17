@@ -23,6 +23,12 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
 # editing platform code.
 MODEL_PACKAGES_DIR   = os.environ.get("MODEL_PACKAGES_DIR", str(PROJECT_ROOT / "model_packages"))
 ACTIVE_MODEL_PACKAGE = os.environ.get("ACTIVE_MODEL_PACKAGE", "ortho_tka")
+# Named tray to force on every process start, before the first inference.
+# A package profile otherwise restores whichever preset was active at the last
+# shutdown; a theatre that always begins on one tray needs a known state each
+# boot instead.  Empty means "don't force anything" — keep the restored preset.
+# run_jetson.sh pairs this with the default package (see that script).
+STARTUP_INVENTORY_PRESET = os.environ.get("STARTUP_INVENTORY_PRESET", "").strip()
 # Per-package operator-editable configuration lives here.
 PROFILES_DIR = os.environ.get("PROFILES_DIR", os.path.join(OUTPUT_DIR, "profiles"))
 # The package that inherits the pre-package global output/standards.json and
