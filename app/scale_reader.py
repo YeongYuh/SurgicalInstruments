@@ -1,6 +1,7 @@
 import logging
 import re
 import threading
+import time
 from collections import deque
 from statistics import median
 from typing import Optional
@@ -105,12 +106,30 @@ class SerialScaleReader(BaseScaleReader):
         stable_min_samples: int = 3,
         max_sample_age_sec: float = 2.0,
         stable_min_coverage_ratio: float = 0.5,
+        reconnect_backoff_initial: float = 0.5,
+        reconnect_backoff_max: float = 5.0,
+        reconnect_log_interval_sec: float = 30.0,
+        max_plausible_grams: float = 20000.0,
     ):
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
         self.retries = retries
         self._ser = None
+
+        # Reconnect pacing.  The background drain calls read_weight() every
+        # SCALE_BG_POLL_INTERVAL (100 ms); without this, an unplugged scale
+        # means 10 open() syscalls and 10 log lines per second forever.
+        self._reconnect_backoff_initial = max(0.0, reconnect_backoff_initial)
+        self._reconnect_backoff_max     = max(self._reconnect_backoff_initial,
+                                              reconnect_backoff_max)
+        self._reconnect_log_interval    = max(0.0, reconnect_log_interval_sec)
+        # Anything heavier than this is not a surgical tray, it is a bad frame.
+        self._max_plausible_grams = float(max_plausible_grams)
+        self._retry_delay  = self._reconnect_backoff_initial
+        self._next_retry_at = 0.0    # monotonic deadline; 0 = try immediately
+        self._down_since    = None   # monotonic time the current outage began
+        self._last_fail_log = 0.0
         self._lock = threading.Lock()        # guards serial I/O (long-held)
         self._cache_lock = threading.Lock()  # guards _latest only (never held during I/O)
         self._latest: Optional[float] = None
@@ -138,9 +157,21 @@ class SerialScaleReader(BaseScaleReader):
     # ── connection management ─────────────────────────────────────────
 
     def _ensure_connected(self) -> bool:
-        """Open the port if not already open. Returns True when ready."""
+        """Open the port if not already open. Returns True when ready.
+
+        While the device is absent this is called at the background drain rate
+        (10 Hz).  Retries are therefore paced by an exponential backoff and the
+        failures are logged once per outage plus a heartbeat, so a scale left
+        unplugged overnight costs a couple of log lines a minute instead of
+        ~36 000 an hour drowning every real error on the box.
+        """
         if self._ser is not None and self._ser.is_open:
             return True
+
+        now = time.monotonic()
+        if now < self._next_retry_at:
+            return False          # still backing off — don't touch the port
+
         try:
             import serial as _serial
             # Configure before opening so dtr=False is set as early as possible.
@@ -154,22 +185,51 @@ class SerialScaleReader(BaseScaleReader):
             ser.timeout = self.timeout
             ser.dtr = False
             ser.open()
+            # A freshly enumerated CH340 can hold a partial frame from before
+            # the unplug.  Parsed as a number that becomes a nonsense weight
+            # (observed: 133938 g), so drop whatever is already buffered.
+            try:
+                ser.reset_input_buffer()
+            except Exception:      # noqa: BLE001 - not fatal, the filter copes
+                pass
             self._ser = ser
             if self._was_connected:
-                logger.info("[ScaleReader] Reconnected to %s at %d baud.",
-                            self.port, self.baudrate)
+                # Recovery is logged at WARNING on purpose: it is the line that
+                # closes an outage, and the kiosk has no console anyone reads at
+                # INFO.  A lost/restored pair must be greppable together.
+                outage = "" if self._down_since is None else \
+                    " after %.1f s" % (now - self._down_since)
+                logger.warning("[ScaleReader] Reconnected to %s at %d baud%s.",
+                               self.port, self.baudrate, outage)
             else:
                 logger.info("[ScaleReader] Connected to %s at %d baud.",
                             self.port, self.baudrate)
             self._was_connected = True
+            self._retry_delay   = self._reconnect_backoff_initial
+            self._next_retry_at = 0.0
+            self._down_since    = None
             return True
         except Exception as exc:
-            logger.warning(
-                "[ScaleReader] Cannot open %s: %s  "
-                "(run: sudo usermod -aG dialout $USER  then re-login)",
-                self.port, exc,
-            )
+            first = self._down_since is None
+            if first:
+                self._down_since = now
+            # ENOENT means the device is simply not plugged in; the dialout
+            # group hint only makes sense for a permission failure and is
+            # actively misleading otherwise.
+            hint = ("  (run: sudo usermod -aG dialout $USER  then re-login)"
+                    if isinstance(exc, PermissionError) else "")
+            if first or (self._reconnect_log_interval > 0
+                         and now - self._last_fail_log >= self._reconnect_log_interval):
+                logger.warning("[ScaleReader] Cannot open %s: %s%s  "
+                               "(retrying, backoff up to %.1f s)",
+                               self.port, exc, hint, self._reconnect_backoff_max)
+                self._last_fail_log = now
+            else:
+                logger.debug("[ScaleReader] Still cannot open %s: %s", self.port, exc)
             self._ser = None
+            self._next_retry_at = now + self._retry_delay
+            self._retry_delay = min(self._retry_delay * 2.0,
+                                    self._reconnect_backoff_max)
             return False
 
     def _drop_connection(self, why: str) -> None:
@@ -186,6 +246,12 @@ class SerialScaleReader(BaseScaleReader):
                 ser.close()
             except Exception:  # noqa: BLE001 - the handle is already broken
                 pass
+        # A new outage always gets one immediate retry before the backoff grows,
+        # so a momentary glitch recovers on the very next poll.
+        self._retry_delay   = self._reconnect_backoff_initial
+        self._next_retry_at = 0.0
+        self._down_since    = None
+        self._last_fail_log = 0.0
         logger.warning("[ScaleReader] Connection dropped (%s) — will reconnect on next read.",
                        why)
 
@@ -237,11 +303,25 @@ class SerialScaleReader(BaseScaleReader):
         """
         return self._tracker.snapshot()
 
+    def _is_plausible(self, value: float) -> bool:
+        """Reject readings no surgical instrument tray could produce."""
+        if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+            return False
+        return abs(value) <= self._max_plausible_grams
+
     def _apply_sample(self, raw_value: float) -> None:
         """Apply transition-aware zero-rejection debounce and median filter.
 
         Called inside self._lock — must NOT acquire self._lock again.
         May acquire self._cache_lock briefly to read/write _latest.
+
+        Values outside the plausible range are dropped here rather than
+        filtered downstream.  Re-plugging the USB re-powers the scale, and its
+        first frame after boot is often garbled — 133938 g and 95588 g were
+        both observed on the bench.  The stability gate already stops such a
+        reading from producing a verdict, but letting it into the window puts a
+        95 kg number on the kiosk and inflates the spread, delaying the point
+        at which a real measurement can settle.
 
         State machine (action per sample):
 
@@ -268,6 +348,12 @@ class SerialScaleReader(BaseScaleReader):
         Key invariant: the rolling window never contains samples from a different
         stable weight than the current one.  Any confirmed transition clears it.
         """
+        if not self._is_plausible(raw_value):
+            logger.warning("[ScaleReader] Discarding implausible reading %.1f g "
+                           "(limit ±%.0f g) — likely a garbled frame.",
+                           raw_value, self._max_plausible_grams)
+            return
+
         is_near_zero = abs(raw_value) <= self._zero_threshold
 
         with self._cache_lock:
@@ -405,6 +491,10 @@ def create_scale_reader(
     stable_min_samples: int = 3,
     max_sample_age_sec: float = 2.0,
     stable_min_coverage_ratio: float = 0.5,
+    reconnect_backoff_initial: float = 0.5,
+    reconnect_backoff_max: float = 5.0,
+    reconnect_log_interval_sec: float = 30.0,
+    max_plausible_grams: float = 20000.0,
 ) -> BaseScaleReader:
     if mode == "mock":
         return MockScaleReader(mock_weight=mock_weight)
@@ -424,5 +514,9 @@ def create_scale_reader(
             stable_min_samples=stable_min_samples,
             max_sample_age_sec=max_sample_age_sec,
             stable_min_coverage_ratio=stable_min_coverage_ratio,
+            reconnect_backoff_initial=reconnect_backoff_initial,
+            reconnect_backoff_max=reconnect_backoff_max,
+            reconnect_log_interval_sec=reconnect_log_interval_sec,
+            max_plausible_grams=max_plausible_grams,
         )
     raise ValueError(f"Unsupported scale reader mode: '{mode}'. Choose 'mock' or 'serial'.")

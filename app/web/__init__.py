@@ -65,6 +65,10 @@ scale_reader = create_scale_reader(
     stable_min_samples=config.SCALE_STABLE_MIN_SAMPLES,
     max_sample_age_sec=config.SCALE_MAX_SAMPLE_AGE_SEC,
     stable_min_coverage_ratio=config.SCALE_STABLE_MIN_COVERAGE_RATIO,
+    reconnect_backoff_initial=config.SCALE_RECONNECT_BACKOFF_INITIAL,
+    reconnect_backoff_max=config.SCALE_RECONNECT_BACKOFF_MAX,
+    reconnect_log_interval_sec=config.SCALE_RECONNECT_LOG_INTERVAL_SEC,
+    max_plausible_grams=config.SCALE_MAX_PLAUSIBLE_GRAMS,
 )
 atexit.register(scale_reader.close)
 

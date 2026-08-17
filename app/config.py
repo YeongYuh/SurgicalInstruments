@@ -95,12 +95,35 @@ SCALE_DEBUG                = os.environ.get("SCALE_DEBUG", "false").lower() == "
 # reading would never settle.  2.5 s asks for ~1.25 s of coverage, which that
 # rate supplies with 4 samples.
 SCALE_STABLE_WINDOW_SEC        = float(os.environ.get("SCALE_STABLE_WINDOW_SEC", "2.5"))
-SCALE_STABLE_RANGE_GRAMS       = float(os.environ.get("SCALE_STABLE_RANGE_GRAMS", "1.0"))
+# Measured on this unit with a ~1091 g fixed load, 95 s / 196 samples at 2.06 Hz:
+# the scale quantises to 1 g and dithered across exactly two adjacent counts
+# (1090/1091), so both the full-run spread and the worst 2.5 s window spread were
+# 1.0 g.  A 1.0 g threshold therefore passes only because the test is <=, with no
+# margin at all: a load that dithers across three counts would never settle.
+# 2.0 g buys one count of headroom and is still 2.5x below
+# SCALE_TRANSITION_THRESHOLD_GRAMS (5.0), which is what "instruments are still
+# being placed" actually looks like — tens to hundreds of grams, not two counts.
+SCALE_STABLE_RANGE_GRAMS       = float(os.environ.get("SCALE_STABLE_RANGE_GRAMS", "2.0"))
 SCALE_STABLE_MIN_SAMPLES       = int(os.environ.get("SCALE_STABLE_MIN_SAMPLES", "3"))
 # Beyond this age the cached reading is reported fresh=false — a cached value
 # must never masquerade as a live measurement after the scale is unplugged.
 SCALE_MAX_SAMPLE_AGE_SEC       = float(os.environ.get("SCALE_MAX_SAMPLE_AGE_SEC", "2.0"))
 SCALE_STABLE_MIN_COVERAGE_RATIO = float(os.environ.get("SCALE_STABLE_MIN_COVERAGE_RATIO", "0.5"))
+
+# Reconnect pacing for the serial scale.  The background drain polls at
+# SCALE_BG_POLL_INTERVAL (100 ms); unpaced, an unplugged scale means 10 failed
+# open() calls and 10 WARNING lines per second, indefinitely.  The first retry
+# after a drop is immediate, then the delay doubles up to the cap.  Failures are
+# logged once per outage plus one heartbeat every LOG_INTERVAL seconds.
+SCALE_RECONNECT_BACKOFF_INITIAL = float(os.environ.get("SCALE_RECONNECT_BACKOFF_INITIAL", "0.5"))
+SCALE_RECONNECT_BACKOFF_MAX     = float(os.environ.get("SCALE_RECONNECT_BACKOFF_MAX", "5.0"))
+SCALE_RECONNECT_LOG_INTERVAL_SEC = float(os.environ.get("SCALE_RECONNECT_LOG_INTERVAL_SEC", "30.0"))
+
+# Upper bound on a believable reading.  Re-plugging the USB re-powers the scale
+# and its first frame after boot is often garbled: 133938 g and 95588 g were
+# both seen on the bench.  Such a value cannot pass the stability gate, but
+# unfiltered it still reaches the kiosk display and inflates the window spread.
+SCALE_MAX_PLAUSIBLE_GRAMS = float(os.environ.get("SCALE_MAX_PLAUSIBLE_GRAMS", "20000.0"))
 
 # Source type — "image" | "webcam"
 SOURCE_TYPE = os.environ.get("SOURCE_TYPE", "image")
